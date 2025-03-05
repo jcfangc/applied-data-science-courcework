@@ -1,7 +1,7 @@
 from typing import Dict
 
-import numpy as np
-from pydantic import BaseModel, Field
+import polars as pl
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from ..enum.round import Round
 
@@ -19,11 +19,56 @@ class ESSVariableData(BaseModel):
         min_length=1,
         description="变量分布所属的具体国家 / The specific country to which the variable distribution belongs",
     )
-    distributions: Dict[Round, np.ndarray] = Field(
+    codelist: Dict[int, str] = Field(
+        ...,
+        description="变量的类别映射表 (整数索引 -> 选项说明) / Variable category mapping (int -> label)",
+    )
+    distributions: Dict[Round, pl.Series] = Field(
         ...,
         min_items=1,
         description="该变量在不同数据集轮次的概率分布 / Probability distributions of this variable across different dataset rounds",
     )
 
     class Config:
-        arbitrary_types_allowed = True  # 允许使用 numpy 类型 / Allow numpy types
+        arbitrary_types_allowed = True  # 允许使用 Polars 类型 / Allow Polars types
+
+    @model_serializer
+    def serialize(self):
+        """
+        序列化 `ESSVariableData`，确保 `pl.Series` 被正确转换为 JSON 兼容格式。
+
+        :return: JSON 兼容的字典
+        """
+        return {
+            "name": self.name,
+            "country": self.country,
+            "codelist": self.codelist,
+            "distributions": {
+                str(round_): dist.to_list()
+                for round_, dist in self.distributions.items()
+            },
+        }
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_distribution_length(cls, values: Dict):
+        """
+        确保所有 distributions 的 pl.Series 长度和 codelist 的长度一致
+        Ensure all pl.Series in distributions have the same length as codelist.
+        """
+        codelist_length: int = len(values.get("codelist", {}))
+        distributions: Dict[Round, pl.Series] = values.get("distributions", {})
+
+        for round_key, series in distributions.items():
+            if not isinstance(series, pl.Series):
+                raise ValueError(
+                    f"轮次 {round_key} 的分布必须是 polars.Series 类型 / "
+                    f"Distribution for round {round_key} must be of type polars.Series"
+                )
+            if len(series) != codelist_length:
+                raise ValueError(
+                    f"轮次 {round_key} 的分布长度 ({len(series)}) 与 codelist 长度 ({codelist_length}) 不匹配 / "
+                    f"Length of distribution for round {round_key} ({len(series)}) does not match codelist length ({codelist_length})"
+                )
+
+        return values

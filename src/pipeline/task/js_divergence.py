@@ -1,7 +1,7 @@
 from datetime import timedelta
 from typing import AsyncGenerator, Dict, List
 
-import numpy as np
+import polars as pl
 from prefect.tasks import task_input_hash
 from scipy.spatial.distance import jensenshannon
 
@@ -11,7 +11,7 @@ from ...definition.const.prefect import LOCAL_STORAGE
 from ...definition.enum.round import Round
 from ...definition.p_model.ess_divergence import (
     ESSSingleDivergence,
-    ESSVariableDivergence,
+    ESSVariableDivergences,
 )
 from ...definition.p_model.ess_variable_data import ESSVariableData
 from ...util.backoff import BackoffStrategy
@@ -36,29 +36,33 @@ class ESSDivergenceCalculator:
         persist_result=True,
         result_storage=LOCAL_STORAGE,
     )
-    def compute_js_divergence(p: np.ndarray, q: np.ndarray) -> float:
+    def compute_js_divergence(p: pl.Series, q: pl.Series) -> float:
         """
-        计算两个概率分布之间的 Jensen-Shannon 散度。
-        Compute the Jensen-Shannon divergence between two probability distributions.
+        计算两个 `polars.Series` 概率分布的 Jensen-Shannon 散度。
+        Compute the Jensen-Shannon divergence between two `polars.Series` probability distributions.
 
-        :param p: 第一个概率分布 (ndarray)
-                  First probability distribution (ndarray)
-        :param q: 第二个概率分布 (ndarray)
-                  Second probability distribution (ndarray)
+        :param p: 第一个概率分布 (`pl.Series`)
+                  First probability distribution (`pl.Series`)
+        :param q: 第二个概率分布 (`pl.Series`)
+                  Second probability distribution (`pl.Series`)
         :return: JS 散度
                  JS divergence
         """
-        if not isinstance(p, np.ndarray) or not isinstance(q, np.ndarray):
-            raise ValueError("输入必须是 numpy.ndarray / Inputs must be numpy.ndarray")
-        if p.shape != q.shape:
+        if not isinstance(p, pl.Series) or not isinstance(q, pl.Series):
+            raise ValueError("输入必须是 polars.Series / Inputs must be polars.Series")
+        if p.len() != q.len():
             raise ValueError(
-                "两个输入的形状必须相同 / Both inputs must have the same shape"
+                "两个输入的长度必须相同 / Both inputs must have the same length"
             )
-        if len(p) == 0:
+        if p.len() == 0:
             raise ValueError("输入数组不能为空 / Input arrays cannot be empty")
 
+        # 转换为 NumPy 进行计算
+        p_np = p.to_numpy()
+        q_np = q.to_numpy()
+
         return (
-            jensenshannon(p + 1e-10, q + 1e-10) ** 2
+            jensenshannon(p_np + 1e-10, q_np + 1e-10) ** 2
         )  # 还原 JS 散度 / Restore JS divergence
 
     @staticmethod
@@ -71,24 +75,24 @@ class ESSDivergenceCalculator:
         result_storage=LOCAL_STORAGE,
     )
     def compute_js_series(
-        distributions: Dict[Round, np.ndarray]
+        distributions: Dict[Round, pl.Series]
     ) -> List[ESSSingleDivergence]:
         """
         计算有序概率分布集合中的相邻分布的 JS 散度。
         Compute the JS divergence between adjacent distributions in an ordered
         set of probability distributions.
 
-        :param distributions: 变量在不同轮次的概率分布 (Dict[Round, np.ndarray])
-                              Probability distributions of variables across different rounds (Dict[Round, np.ndarray])
+        :param distributions: 变量在不同轮次的概率分布 (Dict[Round, pl.Series])
+                              Probability distributions of variables across different rounds (Dict[Round, pl.Series])
         :return: List[ESSDivergence]，包含每个相邻轮次之间的 JS 散度
                  List[ESSDivergence], containing JS divergence between each adjacent round.
         """
         if not isinstance(distributions, dict) or not all(
-            isinstance(k, Round) and isinstance(v, np.ndarray)
+            isinstance(k, Round) and isinstance(v, pl.Series)
             for k, v in distributions.items()
         ):
             raise ValueError(
-                "输入必须是 {Round: np.ndarray} 形式的字典 / Input must be a dictionary in the form {Round: np.ndarray}"
+                "输入必须是 {Round: polars.Series} 形式的字典 / Input must be a dictionary in the form {Round: polars.Series}"
             )
 
         if len(distributions) < 2:
@@ -97,7 +101,10 @@ class ESSDivergenceCalculator:
             )
 
         # 按 Round 的顺序排序 / Sort by Round order
-        sorted_rounds = sorted(distributions.keys(), key=lambda r: r.value)
+        sorted_rounds = sorted(
+            distributions.keys(),
+            key=lambda r: int("".join(filter(str.isdigit, r.name))),
+        )
         sorted_distributions = [distributions[r] for r in sorted_rounds]
 
         # 计算相邻轮次的 JS 散度 / Compute JS divergence between adjacent rounds
@@ -125,7 +132,7 @@ class ESSDivergenceCalculator:
     )
     async def compute_js_batch(
         generator: AsyncGenerator[ESSVariableData, None],
-    ) -> AsyncGenerator[ESSVariableDivergence, None]:
+    ) -> AsyncGenerator[ESSVariableDivergences, None]:
         """
         流式计算多个变量的 JS 散度，逐个返回每个变量的计算结果。
         Stream computation of JS divergence for multiple variables, returning
@@ -142,6 +149,6 @@ class ESSDivergenceCalculator:
             js_series = ESSDivergenceCalculator.compute_js_series(
                 ess_data.distributions
             )
-            yield ESSVariableDivergence(
+            yield ESSVariableDivergences(
                 name=ess_data.name, country=ess_data.country, divergences=js_series
             )
