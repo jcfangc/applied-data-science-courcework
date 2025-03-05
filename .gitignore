@@ -1,0 +1,40 @@
+# 备份和学习文件夹 / Backup and learning folders
+data copy/
+learn/
+
+# 日志文件夹 / Log files
+log/
+
+# Python 编译文件 / Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 环境和依赖文件 / Environments and dependencies
+venv/
+.venv/
+env/
+.env
+poetry.lock
+pipenv.lock
+
+# IDE / 编辑器相关文件 / IDE / Editor related files
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# 系统文件 / System files
+.DS_Store
+Thumbs.db
+
+# Prefect 运行缓存 / Prefect runtime cache
+prefect/
+
+# 私密或敏感信息 / Private or sensitive information
+secrets.json
+*.key
+*.pem
