@@ -1,7 +1,12 @@
-from typing import Dict
+from typing import Any, Dict
 
 import polars as pl
-from pydantic import BaseModel, Field, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_serializer,
+)
 
 from ..enum.round import Round
 
@@ -36,8 +41,7 @@ class ESSVariableData(BaseModel):
     def serialize(self):
         """
         序列化 `ESSVariableData`，确保 `pl.Series` 被正确转换为 JSON 兼容格式。
-
-        :return: JSON 兼容的字典
+        Serialize `ESSVariableData`, ensuring `pl.Series` is properly converted to JSON.
         """
         return {
             "name": self.name,
@@ -49,17 +53,49 @@ class ESSVariableData(BaseModel):
             },
         }
 
-    @model_validator(mode="before")
+    @field_validator("distributions", mode="before")
     @classmethod
-    def validate_distribution_length(cls, values: Dict):
+    def deserialize_distributions(
+        cls, value: Dict[str, list]
+    ) -> Dict[Round, pl.Series]:
+        """
+        反序列化 JSON 格式的 `distributions`，将其转换为 `Dict[Round, pl.Series]`
+        Deserialize `distributions` from JSON format to `Dict[Round, pl.Series]`
+        """
+        if not isinstance(value, dict):
+            raise ValueError("distributions 必须是一个字典")
+
+        parsed_distributions = {}
+        for round_key, data in value.items():
+            try:
+                round_enum = Round.from_str(round_key)
+            except ValueError as e:
+                raise ValueError(
+                    f"无效的轮次标识: {round_key} / Invalid round identifier: {round_key}"
+                ) from e
+
+            if not isinstance(data, list):
+                raise ValueError(
+                    f"轮次 {round_key} 的数据格式应为列表 / "
+                    f"The data format for round {round_key} must be a list."
+                )
+
+            parsed_distributions[round_enum] = pl.Series(data)
+
+        return parsed_distributions
+
+    @field_validator("distributions", mode="after")
+    @classmethod
+    def validate_distribution_length(
+        cls, value: Dict[Round, pl.Series], values: Dict[str, Any]
+    ) -> Dict[Round, pl.Series]:
         """
         确保所有 distributions 的 pl.Series 长度和 codelist 的长度一致
         Ensure all pl.Series in distributions have the same length as codelist.
         """
         codelist_length: int = len(values.get("codelist", {}))
-        distributions: Dict[Round, pl.Series] = values.get("distributions", {})
 
-        for round_key, series in distributions.items():
+        for round_key, series in value.items():
             if not isinstance(series, pl.Series):
                 raise ValueError(
                     f"轮次 {round_key} 的分布必须是 polars.Series 类型 / "
@@ -71,4 +107,4 @@ class ESSVariableData(BaseModel):
                     f"Length of distribution for round {round_key} ({len(series)}) does not match codelist length ({codelist_length})"
                 )
 
-        return values
+        return value

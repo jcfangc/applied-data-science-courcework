@@ -1,11 +1,15 @@
+import json
 from datetime import timedelta
-from typing import AsyncGenerator, Dict, List
+from pathlib import Path
+from typing import AsyncGenerator, Dict, List, Optional
 
+import aiofiles
 import polars as pl
-from prefect.tasks import task_input_hash
+from loguru import logger
 from scipy.spatial.distance import jensenshannon
 
 from prefect import task
+from prefect.tasks import task_input_hash
 
 from ...definition.const.prefect import LOCAL_STORAGE
 from ...definition.enum.round import Round
@@ -20,7 +24,7 @@ from ...util.backoff import BackoffStrategy
 backoff = BackoffStrategy()
 
 
-class ESSDivergenceCalculator:
+class ESSDivergenceCalculatorTask:
     """
     计算 ESS 数据集中，不同轮次之间，同一国家的变量分布散度。
     Calculate the distribution divergence of variables for the same country
@@ -30,7 +34,61 @@ class ESSDivergenceCalculator:
     @staticmethod
     @task(
         cache_key_fn=task_input_hash,
-        retries=5,
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+        cache_expiration=timedelta(hours=1),
+        persist_result=True,
+        result_storage=LOCAL_STORAGE,
+    )
+    async def load_from_json(
+        file_path: str | Path,
+    ) -> AsyncGenerator[ESSVariableData, None]:
+        """
+        **异步读取 JSON 文件**，并逐个返回 `ESSVariableData` 实例。\n
+        Asynchronously reads a JSON file and yields `ESSVariableData` instances one by one.
+
+        :param file_path: JSON 文件路径。\n
+                          Path to the JSON file.
+        :yield: `ESSVariableData` 实例。\n
+                `ESSVariableData` instances.
+        """
+        file_path = Path(file_path)
+
+        if not file_path.exists():
+            raise FileNotFoundError(
+                f"文件未找到: {file_path}\nFile not found: {file_path}"
+            )
+
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            logger.info(
+                f"正在读取 JSON 文件: {file_path}\nReading JSON file: {file_path}"
+            )
+            raw_data = await f.read()
+            data_list = json.loads(raw_data)
+
+        if not isinstance(data_list, list):
+            raise ValueError(
+                "JSON 文件内容应为列表格式 / JSON file content should be a list."
+            )
+
+        for data in data_list:
+            try:
+                yield ESSVariableData(**data)
+                logger.info(
+                    f"成功解析变量: {data.get('name', 'UNKNOWN')}\n"
+                    f"Successfully parsed variable: {data.get('name', 'UNKNOWN')}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"解析失败，跳过变量: {data.get('name', 'UNKNOWN')}，错误: {e}\n"
+                    f"Parsing failed, skipping variable: {data.get('name', 'UNKNOWN')}, error: {e}"
+                )
+                continue  # 跳过错误数据 / Skip invalid data
+
+    @staticmethod
+    @task(
+        cache_key_fn=task_input_hash,
+        retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
         cache_expiration=timedelta(hours=1),
         persist_result=True,
@@ -49,21 +107,26 @@ class ESSDivergenceCalculator:
                  JS divergence
         """
         if not isinstance(p, pl.Series) or not isinstance(q, pl.Series):
+            logger.error(
+                "输入错误：输入必须是 polars.Series / Inputs must be polars.Series"
+            )
             raise ValueError("输入必须是 polars.Series / Inputs must be polars.Series")
         if p.len() != q.len():
+            logger.error(
+                "输入错误：两个输入的长度不一致 / Both inputs must have the same length"
+            )
             raise ValueError(
                 "两个输入的长度必须相同 / Both inputs must have the same length"
             )
         if p.len() == 0:
+            logger.error("输入错误：输入数组为空 / Input arrays cannot be empty")
             raise ValueError("输入数组不能为空 / Input arrays cannot be empty")
 
-        # 转换为 NumPy 进行计算
         p_np = p.to_numpy()
         q_np = q.to_numpy()
-
-        return (
-            jensenshannon(p_np + 1e-10, q_np + 1e-10) ** 2
-        )  # 还原 JS 散度 / Restore JS divergence
+        result = jensenshannon(p_np + 1e-10, q_np + 1e-10) ** 2
+        logger.info("Completed compute_js_divergence: result = {result}", result=result)
+        return result
 
     @staticmethod
     @task(
@@ -75,7 +138,7 @@ class ESSDivergenceCalculator:
         result_storage=LOCAL_STORAGE,
     )
     def compute_js_series(
-        distributions: Dict[Round, pl.Series]
+        distributions: Dict[Round, pl.Series],
     ) -> List[ESSSingleDivergence]:
         """
         计算有序概率分布集合中的相邻分布的 JS 散度。
@@ -87,15 +150,28 @@ class ESSDivergenceCalculator:
         :return: List[ESSDivergence]，包含每个相邻轮次之间的 JS 散度
                  List[ESSDivergence], containing JS divergence between each adjacent round.
         """
+        logger.info(
+            "开始计算相邻轮次的 JS 散度\nStarting computation of JS divergence between adjacent rounds."
+        )
+
+        # 参数检查 / Parameter validation
         if not isinstance(distributions, dict) or not all(
             isinstance(k, Round) and isinstance(v, pl.Series)
             for k, v in distributions.items()
         ):
+            logger.error(
+                "输入错误: 期望的格式为 {Round: polars.Series}\n"
+                "Input error: Expected format {Round: polars.Series}"
+            )
             raise ValueError(
                 "输入必须是 {Round: polars.Series} 形式的字典 / Input must be a dictionary in the form {Round: polars.Series}"
             )
 
         if len(distributions) < 2:
+            logger.error(
+                "数据错误: 至少需要 2 轮数据进行计算\n"
+                "Data error: At least 2 rounds of data are required for computation."
+            )
             raise ValueError(
                 "必须至少包含两个轮次的数据才能计算 JS 散度 / At least two rounds of data are required to compute JS divergence"
             )
@@ -107,24 +183,47 @@ class ESSDivergenceCalculator:
         )
         sorted_distributions = [distributions[r] for r in sorted_rounds]
 
+        logger.info(
+            f"数据轮次排序完成: {sorted_rounds}\nData rounds sorted: {sorted_rounds}"
+        )
+
         # 计算相邻轮次的 JS 散度 / Compute JS divergence between adjacent rounds
-        js_results = [
-            ESSSingleDivergence(
-                round_from=sorted_rounds[i],
-                round_to=sorted_rounds[i + 1],
-                js_divergence=ESSDivergenceCalculator.compute_js_divergence(
-                    sorted_distributions[i], sorted_distributions[i + 1]
-                ),
+        js_results = []
+        for i in range(len(sorted_distributions) - 1):
+            round_from = sorted_rounds[i]
+            round_to = sorted_rounds[i + 1]
+            logger.info(
+                f"计算 {round_from} → {round_to} 的 JS 散度\n"
+                f"Computing JS divergence from {round_from} → {round_to}"
             )
-            for i in range(len(sorted_distributions) - 1)
-        ]
+
+            js_divergence = ESSDivergenceCalculatorTask.compute_js_divergence(
+                sorted_distributions[i], sorted_distributions[i + 1]
+            )
+
+            logger.info(
+                f"{round_from} → {round_to} 计算完成, JS 散度值: {js_divergence}\n"
+                f"Computation completed for {round_from} → {round_to}, JS divergence: {js_divergence}"
+            )
+
+            js_results.append(
+                ESSSingleDivergence(
+                    round_from=round_from,
+                    round_to=round_to,
+                    js_divergence=js_divergence,
+                )
+            )
+
+        logger.info(
+            "所有相邻轮次的 JS 散度计算完成\n"
+            "All adjacent rounds' JS divergence computations completed."
+        )
 
         return js_results
 
     @staticmethod
     @task(
         persist_result=False,  # 流式返回不直接持久化，由 Flow 负责消费
-        # Stream processing without direct persistence, handled by the Flow consumer
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
         cache_key_fn=task_input_hash,
@@ -132,23 +231,35 @@ class ESSDivergenceCalculator:
     )
     async def compute_js_batch(
         generator: AsyncGenerator[ESSVariableData, None],
+        target_name: Optional[str] = None,
+        target_country: Optional[str] = None,
     ) -> AsyncGenerator[ESSVariableDivergences, None]:
         """
-        流式计算多个变量的 JS 散度，逐个返回每个变量的计算结果。
-        Stream computation of JS divergence for multiple variables, returning
-        results one by one.
+        计算多个变量的 JS 散度，并根据 `target_name` 和 `target_country` 进行筛选。
+        Compute JS divergence for multiple variables, filtering based on `target_name` and `target_country`.
 
         :param generator: 异步生成器，逐步提供 ESSVariableData 实例
-                          Asynchronous generator providing instances of ESSVariableData
-        :yield: 每个变量对应的 ESSVariableDivergence 对象
-                Yields an ESSVariableDivergence object for each variable.
+                        Asynchronous generator providing instances of ESSVariableData.
+        :param target_name: 目标变量名称，可选，若提供则仅返回该变量的结果
+                            Target variable name, optional. If provided, only return results for this variable.
+        :param target_country: 目标国家，可选，若提供则仅返回该国家的数据
+                            Target country, optional. If provided, only return results for this country.
+        :yield: 满足筛选条件的 ESSVariableDivergences 对象
+                Yields `ESSVariableDivergences` objects matching the filtering criteria.
         """
         async for ess_data in generator:
-            # 调用工具类中计算单个变量 JS 散度序列的 Task
-            # Call the utility function to compute the JS divergence series for a single variable
-            js_series = ESSDivergenceCalculator.compute_js_series(
+            # **筛选符合 `target_name` 和 `target_country` 的数据**
+            if target_name and ess_data.name != target_name:
+                continue
+            if target_country and ess_data.country != target_country:
+                continue
+
+            # 计算 JS 散度序列
+            js_series = ESSDivergenceCalculatorTask.compute_js_series(
                 ess_data.distributions
             )
+
+            # 生成符合筛选条件的结果
             yield ESSVariableDivergences(
                 name=ess_data.name, country=ess_data.country, divergences=js_series
             )
