@@ -32,7 +32,7 @@ class CausalityAdjacencyMatrix(BaseModel):
 
         adjacency_matrix = {
             var1: {
-                var2: CausalityComputationStatus.FAILED
+                var2: CausalityComputationStatus.PENDING
                 for var2 in sorted_variables[i + 1 :]
             }
             for i, var1 in enumerate(sorted_variables)
@@ -69,7 +69,7 @@ class CausalityAdjacencyMatrix(BaseModel):
         """
         var1, var2 = sorted([var1, var2])  # 确保 var1 < var2 / Ensure var1 < var2
         return self.adjacency_matrix.get(var1, {}).get(
-            var2, CausalityComputationStatus.FAILED
+            var2, CausalityComputationStatus.PENDING
         )
 
     async def iter_adjacency_entries(

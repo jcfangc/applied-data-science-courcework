@@ -1,5 +1,6 @@
 from datetime import timedelta
-from typing import List, Tuple
+from pathlib import Path
+from typing import AsyncGenerator, Awaitable, Callable, Dict, List, Tuple
 
 import numpy as np
 from loguru import logger
@@ -8,12 +9,15 @@ from statsmodels.tsa.stattools import grangercausalitytests
 from prefect import task
 from prefect.tasks import task_input_hash
 
+from ...definition.enum.causality_computation_status import CausalityComputationStatus
+from ...definition.p_model.causality_adjacency_matrix import CausalityAdjacencyMatrix
 from ...definition.p_model.ess_causality import ESSCausalityResult
 from ...definition.p_model.ess_divergence import (
     ESSSingleDivergence,
     ESSVariableDivergences,
 )
 from ...util.backoff import BackoffStrategy
+from .read_write import ReadWriteTask
 
 # 创建退避策略实例 / Create a backoff strategy instance
 backoff = BackoffStrategy()
@@ -168,6 +172,10 @@ class ESSCausalityCalculatorTask:
                 f"do not belong to the same country!"
             )
 
+        # 调整顺序，确保两个散度列表顺序一致 / Adjust order to ensure the two divergence lists match.
+        variable_a = ESSCausalityCalculatorTask.sort_variable_divergence(variable_a)
+        variable_b = ESSCausalityCalculatorTask.sort_variable_divergence(variable_b)
+
         # 提取 JS 散度数据作为时间序列 / Extract JS divergence data as time series.
         js_a = np.array([d.js_divergence for d in variable_a.divergences])
         js_b = np.array([d.js_divergence for d in variable_b.divergences])
@@ -219,3 +227,98 @@ class ESSCausalityCalculatorTask:
                 p_value=b_to_a_p_value,
             ),
         )
+
+    @staticmethod
+    @task(
+        persist_result=False,  # 仅流式返回，由 Flow 负责存储
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+        cache_key_fn=task_input_hash,
+        cache_expiration=timedelta(hours=1),
+    )
+    async def compute_causal_relationship_from_adjacency(
+        adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],
+        adjacency_entries_generator: AsyncGenerator[
+            Tuple[str, str, str, CausalityComputationStatus], None
+        ],
+        js_divergence_gen_cache_file: str | Path,
+        deserialize_fn: Callable[[dict], Awaitable[ESSVariableDivergences]],
+        maxlag: int = 2,
+    ) -> AsyncGenerator[ESSCausalityResult, None]:
+        """
+        从邻接表提取变量对，并计算因果关系，避免重复计算。
+        Extracts variable pairs from adjacency matrix and computes causality, avoiding redundant computations.
+
+        :param adjacency_matrices: 因果邻接表字典，包含 `country -> adjacency matrix`。
+                                   Dictionary mapping `country -> adjacency matrix`.
+        :param adjacency_entries_generator: 邻接表条目流，包含 `(country, var1, var2, status)`。
+                                           Adjacency matrix entry stream containing `(country, var1, var2, status)`.
+        :param js_divergence_cache_file: 缓存文件路径，用于重新加载JS散度数据生成器。
+                                         Cache file path used to reload JS divergence data generator.
+        :param deserialize_fn: 异步反序列化函数。
+                               Asynchronous deserialization function.
+        :param maxlag: Granger 滞后阶数，默认 `2`。
+                       Granger test max lag, default is `2`.
+        :yield: `ESSCausalityResult`，包含 `country, var1, var2, p_value`。
+                Yields `ESSCausalityResult`, containing `country, var1, var2, p_value`.
+        """
+
+        async for country, var1, var2, status in adjacency_entries_generator:
+            if status != CausalityComputationStatus.PENDING:
+                continue  # 只处理 PENDING 状态的变量对
+
+            logger.info(
+                f"提取 {country} 变量 {var1} 和 {var2} 进行因果分析。\n"
+                f"Extracting {var1} and {var2} from {country} for causality analysis."
+            )
+
+            # 每次都从缓存重新加载生成器，确保可重复消费
+            js_divergence_generator: AsyncGenerator[ESSVariableDivergences, None] = (
+                ReadWriteTask.load_async_generator_from_cache(
+                    deserialize_fn=deserialize_fn,
+                    cache_file=js_divergence_gen_cache_file,
+                )
+            )
+
+            variable_a, variable_b = None, None
+            async for js_data in js_divergence_generator:
+                if js_data.country == country and js_data.name == var1:
+                    variable_a = js_data
+                elif js_data.country == country and js_data.name == var2:
+                    variable_b = js_data
+                if variable_a and variable_b:
+                    break  # 找到两个变量，停止遍历
+
+            if not variable_a or not variable_b:
+                logger.warning(
+                    f"缺失 {country} 的变量数据: {var1}, {var2}，跳过。\n"
+                    f"Missing variable data for {country}: {var1}, {var2}, skipping."
+                )
+                continue
+
+            # 更新邻接表状态 / Update adjacency matrix status
+            adjacency_matrices[country].update_status(
+                var1, var2, CausalityComputationStatus.IN_PROGRESS
+            )
+
+            # 调用 `compute_causal_relationship` 计算因果关系 / Call `compute_causal_relationship` to compute causality
+            result_a, result_b = ESSCausalityCalculatorTask.compute_causal_relationship(
+                variable_a=variable_a,
+                variable_b=variable_b,
+                maxlag=maxlag,
+            )
+
+            logger.info(
+                f"计算完成 {result_a.causality_from} → {result_a.causality_to} (p={result_a.p_value})\n"
+                f"计算完成 {result_b.causality_from} → {result_b.causality_to} (p={result_b.p_value})\n"
+                f"Completed causality computation {result_a.causality_from} → {result_a.causality_to} (p={result_a.p_value})\n"
+                f"Completed causality computation {result_b.causality_from} → {result_b.causality_to} (p={result_b.p_value})"
+            )
+
+            # 更新邻接表状态 / Update adjacency matrix status
+            adjacency_matrices[country].update_status(
+                var1, var2, CausalityComputationStatus.SUCCESS
+            )
+
+            yield result_a
+            yield result_b

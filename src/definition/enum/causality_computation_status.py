@@ -6,6 +6,6 @@ class CausalityComputationStatus(Enum):
     Causality computation status enumeration.
     """
 
-    FAILED = "failed"  # 计算失败 / Computation failed
+    PENDING = "pending"  # 计算失败 / Computation failed
     IN_PROGRESS = "in_progress"  # 计算中 / Computation in progress
     SUCCESS = "success"  # 计算成功 / Computation succeeded

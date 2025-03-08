@@ -1,7 +1,7 @@
 import json
 from datetime import timedelta
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, TypeVar
 
 import aiofiles
 from loguru import logger
@@ -9,6 +9,7 @@ from loguru import logger
 from prefect import task
 from prefect.tasks import task_input_hash
 
+from ...definition.const.core import CAUSALITY_DIR, DEFAULT_CACHE_FILE
 from ...definition.const.prefect import LOCAL_STORAGE
 from ...definition.p_model.ess_causality import ESSCausalityResult
 from ...definition.p_model.ess_variable_data import ESSVariableData
@@ -16,6 +17,9 @@ from ...util.backoff import BackoffStrategy
 
 # 创建退避策略实例
 backoff = BackoffStrategy()
+
+# 类型变量
+T = TypeVar("T")
 
 
 class ReadWriteTask:
@@ -35,15 +39,15 @@ class ReadWriteTask:
     )
     async def save_causality_results_to_csv(
         result_generator: AsyncGenerator[ESSCausalityResult, None],
-        output_path: str | Path,
+        output_path: str | Path = CAUSALITY_DIR / "causality_results.csv",
     ):
         """
-        **异步任务**：将 `ESSCausalityResult` 结果持久化到 CSV 文件。\n
-        **Asynchronous task**: Persist `ESSCausalityResult` results to a CSV file.
+        异步任务：将 `ESSCausalityResult` 结果持久化到 CSV 文件。
+        Asynchronous task: Persist `ESSCausalityResult` results to a CSV file.
 
         :param result_generator: `AsyncGenerator[ESSCausalityResult, None]`
-                                 逐个提供因果分析结果的异步生成器。
-                                 An asynchronous generator yielding causality analysis results.
+                                    逐个提供因果分析结果的异步生成器。
+                                    An asynchronous generator yielding causality analysis results.
         :param output_path: `str | Path`
                             输出 CSV 文件路径。
                             The path to the output CSV file.
@@ -89,11 +93,11 @@ class ReadWriteTask:
         file_path: str | Path,
     ) -> AsyncGenerator[ESSVariableData, None]:
         """
-        **异步读取 JSON 文件**，并逐个返回 `ESSVariableData` 实例。\n
+        异步读取 JSON 文件，并逐个返回 `ESSVariableData` 实例。\n
         Asynchronously reads a JSON file and yields `ESSVariableData` instances one by one.
 
         :param file_path: JSON 文件路径。\n
-                          Path to the JSON file.
+                            Path to the JSON file.
         :yield: `ESSVariableData` 实例。\n
                 `ESSVariableData` instances.
         """
@@ -109,7 +113,7 @@ class ReadWriteTask:
                 f"正在读取 JSON 文件: {file_path}\nReading JSON file: {file_path}"
             )
             raw_data = await f.read()
-            data_list = json.loads(raw_data)
+            data_list: List[Dict[str, Any]] = json.loads(raw_data)
 
         if not isinstance(data_list, list):
             raise ValueError(
@@ -118,7 +122,7 @@ class ReadWriteTask:
 
         for data in data_list:
             try:
-                yield ESSVariableData(**data)
+                yield ESSVariableData(data)
                 logger.info(
                     f"成功解析变量: {data.get('name', 'UNKNOWN')}\n"
                     f"Successfully parsed variable: {data.get('name', 'UNKNOWN')}"
@@ -129,3 +133,82 @@ class ReadWriteTask:
                     f"Parsing failed, skipping variable: {data.get('name', 'UNKNOWN')}, error: {e}"
                 )
                 continue  # 跳过错误数据 / Skip invalid data
+
+    @task(
+        persist_result=True,
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+        cache_key_fn=task_input_hash,
+        cache_expiration=timedelta(hours=1),
+    )
+    async def cache_async_generator(
+        generator: AsyncGenerator[T, None],
+        serialize_fn: Callable[[T], Awaitable[dict]],
+        cache_file: str | Path = DEFAULT_CACHE_FILE,
+    ) -> Path:
+        """
+        将异步生成器中的数据缓存到 JSONL 文件中。\n
+        Caches data from an asynchronous generator into a JSONL file.
+
+        :param generator: 原始异步生成器。\n
+                        The original asynchronous generator.
+        :param serialize_fn: 异步序列化函数，将数据转换为可 JSON 序列化的字典。\n
+                            An asynchronous serialization function that converts data into a JSON-serializable dictionary.
+        :param cache_file: 缓存文件路径。\n
+                        The path to the cache file.
+        :return: 缓存文件路径。\n
+                The path to the cache file.
+        """
+        cache_file = Path(cache_file)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+        async with aiofiles.open(cache_file, mode="w", encoding="utf-8") as f:
+            async for item in generator:
+                data_dict = await serialize_fn(item)
+                await f.write(json.dumps(data_dict) + "\n")
+
+        logger.info(
+            f"数据已缓存到文件: {cache_file}\n"
+            f"Data has been cached to file: {cache_file}"
+        )
+        return cache_file
+
+    @task(
+        persist_result=False,  # 流式返回 / Streamed output
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+        cache_key_fn=task_input_hash,
+        cache_expiration=timedelta(hours=1),
+    )
+    async def load_async_generator_from_cache(
+        deserialize_fn: Callable[[dict], Awaitable[T]],
+        cache_file: str | Path = DEFAULT_CACHE_FILE,
+    ) -> AsyncGenerator[T, None]:
+        """
+        从 JSONL 缓存文件恢复异步生成器。\n
+        Restores an asynchronous generator from a JSONL cache file.
+
+        :param cache_file: 缓存文件路径。\n
+                        The path to the cache file.
+        :param deserialize_fn: 异步反序列化函数，将 JSON 字典恢复为原始数据类型。\n
+                            An asynchronous deserialization function that converts a JSON dictionary back to the original data type.
+        :yield: 异步生成器中的数据。\n
+                Data from the asynchronous generator.
+        """
+        cache_file = Path(cache_file)
+
+        if not cache_file.exists():
+            raise FileNotFoundError(
+                f"缓存文件未找到: {cache_file}\nCache file not found: {cache_file}"
+            )
+
+        async with aiofiles.open(cache_file, mode="r", encoding="utf-8") as f:
+            async for line in f:
+                data_dict = json.loads(line)
+                item = await deserialize_fn(data_dict)
+                yield item
+
+        logger.info(
+            f"已成功从缓存文件恢复数据: {cache_file}\n"
+            f"Successfully restored data from cache file: {cache_file}"
+        )
