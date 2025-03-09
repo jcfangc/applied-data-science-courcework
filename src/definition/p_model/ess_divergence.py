@@ -66,7 +66,7 @@ class ESSVariableDivergences(BaseModel):
     )
     divergences: List[ESSSingleDivergence] = Field(
         ...,
-        min_items=1,
+        min_length=1,
         description="该变量在不同轮次间的 JS 散度列表，至少包含一个散度值 / List of JS divergences between different rounds for this variable, must contain at least one divergence value",
     )
 

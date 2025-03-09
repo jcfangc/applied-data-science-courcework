@@ -137,6 +137,41 @@ class ESSCausalityCalculatorTask:
         cache_key_fn=task_input_hash,
         cache_expiration=timedelta(hours=1),
     )
+    def bidirectional_granger_test(
+        js_a: np.ndarray, js_b: np.ndarray, maxlag: int
+    ) -> Tuple[float, float]:
+        """
+        对两个时间序列分别进行 Granger 因果检验，返回双向的 p-value。
+
+        :param js_a: 第一个时间序列数据（例如变量 A）
+                     First time series data (e.g., variable A).
+        :param js_b: 第二个时间序列数据（例如变量 B）
+                     Second time series data (e.g., variable B).
+        :param maxlag: 最大滞后阶数
+                       Maximum lag order.
+        :return: Tuple (p_value_a_causes_b, p_value_b_causes_a)
+        """
+        # 测试 js_a 是否 Granger-causes js_b：
+        # 构造输入数据时：第一列作为被解释变量（js_b），第二列作为解释变量（js_a）
+        granger_data_a2b = np.column_stack([js_b, js_a])
+        results_a2b = grangercausalitytests(granger_data_a2b, maxlag=maxlag)
+        p_value_a2b = results_a2b[maxlag][0]["ssr_ftest"][1]
+
+        # 测试 js_b 是否 Granger-causes js_a：
+        granger_data_b2a = np.column_stack([js_a, js_b])
+        results_b2a = grangercausalitytests(granger_data_b2a, maxlag=maxlag)
+        p_value_b2a = results_b2a[maxlag][0]["ssr_ftest"][1]
+
+        return p_value_a2b, p_value_b2a
+
+    @staticmethod
+    @task(
+        persist_result=True,
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+        # cache_key_fn=task_input_hash,
+        # cache_expiration=timedelta(hours=1),
+    )
     def compute_causal_relationship(
         variable_a: ESSVariableDivergences,
         variable_b: ESSVariableDivergences,
@@ -192,23 +227,18 @@ class ESSCausalityCalculatorTask:
             f"Granger causality test input data constructed, sample length: {len(js_a)}"
         )
 
-        # 构造 Granger 因果分析输入数据 / Construct input data for Granger causality tests.
-        granger_data = np.column_stack([js_a, js_b])
-
-        # 执行 Granger 因果分析（最大滞后期设为 maxlag） / Run Granger causality tests with maximum lag = maxlag.
-        granger_results = grangercausalitytests(
-            granger_data, maxlag=maxlag, verbose=False
-        )
-
-        # 提取 p 值（选择滞后阶数为 2 的结果） / Extract p-values (using results for lag 2).
-        a_to_b_p_value = granger_results[maxlag][0]["ssr_ftest"][1]  # A → B
-        b_to_a_p_value = granger_results[maxlag][1]["ssr_ftest"][1]  # B → A
+        try:
+            a_to_b_p_value, b_to_a_p_value = (
+                ESSCausalityCalculatorTask.bidirectional_granger_test(
+                    js_a, js_b, maxlag
+                )
+            )
+        except Exception as e:
+            logger.error(f"Granger 因果分析失败 / Granger causality test failed: {e}")
+            raise e
 
         logger.info(
-            f"因果关系计算完成:\n"
-            f"[{variable_a.country}]: {variable_a.name} → {variable_b.name}: p-value = {a_to_b_p_value}\n"
-            f"[{variable_a.country}]: {variable_b.name} → {variable_a.name}: p-value = {b_to_a_p_value}\n"
-            f"Causality computation complete:\n"
+            f"因果关系计算完成 / Causality computation completed:\n"
             f"[{variable_a.country}]: {variable_a.name} → {variable_b.name}: p-value = {a_to_b_p_value}\n"
             f"[{variable_a.country}]: {variable_b.name} → {variable_a.name}: p-value = {b_to_a_p_value}"
         )
@@ -296,10 +326,14 @@ class ESSCausalityCalculatorTask:
                 )
                 continue
 
+            logger.info("1")
+
             # 更新邻接表状态 / Update adjacency matrix status
-            adjacency_matrices[country].update_status(
+            await adjacency_matrices[country].update_status(
                 var1, var2, CausalityComputationStatus.IN_PROGRESS
             )
+
+            logger.info("2")
 
             # 调用 `compute_causal_relationship` 计算因果关系 / Call `compute_causal_relationship` to compute causality
             result_a, result_b = ESSCausalityCalculatorTask.compute_causal_relationship(
@@ -316,9 +350,11 @@ class ESSCausalityCalculatorTask:
             )
 
             # 更新邻接表状态 / Update adjacency matrix status
-            adjacency_matrices[country].update_status(
+            await adjacency_matrices[country].update_status(
                 var1, var2, CausalityComputationStatus.SUCCESS
             )
+
+            logger.info("3")
 
             yield result_a
             yield result_b

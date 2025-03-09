@@ -27,8 +27,9 @@ class Round(Enum):
         """
 
         def extract_digits(s: str) -> str:
-            """提取字符串中的所有数字部分"""
-            return "".join(re.findall(r"\d+", s))
+            """提取字符串中 'ESS' 后的数字部分"""
+            m = re.search(r"ESS(\d+)", s)
+            return m.group(1) if m else ""
 
         input_digits = extract_digits(value)
 

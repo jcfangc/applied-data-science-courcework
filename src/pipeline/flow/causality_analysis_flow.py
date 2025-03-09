@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from prefect import flow
@@ -17,6 +18,8 @@ async def causality_analysis_flow(
     causality_results_csv: Path = CAUSALITY_DIR / "granger_causality_results.csv",
     maxlag: int = 2,
 ) -> None:
+    # LOCAL_STORAGE.save(name="local-storage", overwrite=True)
+
     # Step 1: 加载 JSON 数据
     # Step 1: Load JSON data
     ess_data_generator = ReadWriteTask.load_from_json(file_path=json_file)
@@ -31,14 +34,18 @@ async def causality_analysis_flow(
     # Step 3: Cache JS divergence results to file
     await ReadWriteTask.cache_async_generator(
         generator=js_divergence_generator,
-        serialize_fn=lambda data: data.serialize(),
+        serialize_fn=lambda data: asyncio.to_thread(
+            ESSVariableDivergences.serialize, data
+        ),
         cache_file=js_cache_file,
     )
 
     # Step 4: 从缓存加载 JS 散度数据
     # Step 4: Load JS divergence data from cache
     js_divergence_cached_generator = ReadWriteTask.load_async_generator_from_cache(
-        deserialize_fn=lambda data: ESSVariableDivergences.model_validate(data),
+        deserialize_fn=lambda data: asyncio.to_thread(
+            ESSVariableDivergences.model_validate, data
+        ),
         cache_file=js_cache_file,
     )
 
@@ -61,7 +68,9 @@ async def causality_analysis_flow(
             adjacency_matrices=adjacency_matrices,
             adjacency_entries_generator=adjacency_entries_generator,
             js_divergence_gen_cache_file=js_cache_file,
-            deserialize_fn=lambda data: ESSVariableDivergences.model_validate(data),
+            deserialize_fn=lambda data: asyncio.to_thread(
+                ESSVariableDivergences.model_validate, data
+            ),
             maxlag=maxlag,
         )
     )

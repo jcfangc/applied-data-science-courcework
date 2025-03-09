@@ -1,9 +1,11 @@
-from typing import Any, Dict
+from typing import Dict
 
 import polars as pl
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
+    ValidationInfo,
     field_validator,
     model_serializer,
 )
@@ -30,12 +32,11 @@ class ESSVariableData(BaseModel):
     )
     distributions: Dict[Round, pl.Series] = Field(
         ...,
-        min_items=1,
+        min_length=1,
         description="该变量在不同数据集轮次的概率分布 / Probability distributions of this variable across different dataset rounds",
     )
 
-    class Config:
-        arbitrary_types_allowed = True  # 允许使用 Polars 类型 / Allow Polars types
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @model_serializer
     def serialize(self):
@@ -87,13 +88,14 @@ class ESSVariableData(BaseModel):
     @field_validator("distributions", mode="after")
     @classmethod
     def validate_distribution_length(
-        cls, value: Dict[Round, pl.Series], values: Dict[str, Any]
+        cls, value: Dict[Round, pl.Series], info: ValidationInfo
     ) -> Dict[Round, pl.Series]:
         """
         确保所有 distributions 的 pl.Series 长度和 codelist 的长度一致
         Ensure all pl.Series in distributions have the same length as codelist.
         """
-        codelist_length: int = len(values.get("codelist", {}))
+        codelist = info.data.get("codelist", {})
+        codelist_length: int = len(codelist)
 
         for round_key, series in value.items():
             if not isinstance(series, pl.Series):

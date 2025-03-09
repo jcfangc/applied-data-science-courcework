@@ -10,7 +10,6 @@ from prefect import task
 from prefect.tasks import task_input_hash
 
 from ...definition.const.core import CAUSALITY_DIR, DEFAULT_CACHE_FILE
-from ...definition.const.prefect import LOCAL_STORAGE
 from ...definition.p_model.ess_causality import ESSCausalityResult
 from ...definition.p_model.ess_variable_data import ESSVariableData
 from ...util.backoff import BackoffStrategy
@@ -35,7 +34,6 @@ class ReadWriteTask:
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
         cache_expiration=timedelta(hours=1),
         persist_result=True,
-        result_storage=LOCAL_STORAGE,
     )
     async def save_causality_results_to_csv(
         result_generator: AsyncGenerator[ESSCausalityResult, None],
@@ -69,6 +67,7 @@ class ReadWriteTask:
                 )  # 写入 CSV 头 / Write CSV header
 
                 async for result in result_generator:
+                    logger.debug(f"正在写入结果: {result}")
                     row = result.serialize()
                     await f.write(",".join(map(str, row.values())) + "\n")
 
@@ -87,7 +86,6 @@ class ReadWriteTask:
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
         cache_expiration=timedelta(hours=1),
         persist_result=True,
-        result_storage=LOCAL_STORAGE,
     )
     async def load_from_json(
         file_path: str | Path,
@@ -122,13 +120,14 @@ class ReadWriteTask:
 
         for data in data_list:
             try:
-                yield ESSVariableData(data)
+                yield ESSVariableData(**data)
                 logger.info(
                     f"成功解析变量: {data.get('name', 'UNKNOWN')}\n"
                     f"Successfully parsed variable: {data.get('name', 'UNKNOWN')}"
                 )
             except Exception as e:
                 logger.error(
+                    f"data: {data}\n"
                     f"解析失败，跳过变量: {data.get('name', 'UNKNOWN')}，错误: {e}\n"
                     f"Parsing failed, skipping variable: {data.get('name', 'UNKNOWN')}, error: {e}"
                 )

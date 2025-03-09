@@ -11,7 +11,6 @@ from scipy.spatial.distance import jensenshannon
 from prefect import task
 from prefect.tasks import task_input_hash
 
-from ...definition.const.prefect import LOCAL_STORAGE
 from ...definition.enum.round import Round
 from ...definition.p_model.ess_divergence import (
     ESSSingleDivergence,
@@ -38,61 +37,6 @@ class ESSDivergenceCalculatorTask:
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
         cache_expiration=timedelta(hours=1),
         persist_result=True,
-        result_storage=LOCAL_STORAGE,
-    )
-    async def load_from_json(
-        file_path: str | Path,
-    ) -> AsyncGenerator[ESSVariableData, None]:
-        """
-        **异步读取 JSON 文件**，并逐个返回 `ESSVariableData` 实例。\n
-        Asynchronously reads a JSON file and yields `ESSVariableData` instances one by one.
-
-        :param file_path: JSON 文件路径。\n
-                          Path to the JSON file.
-        :yield: `ESSVariableData` 实例。\n
-                `ESSVariableData` instances.
-        """
-        file_path = Path(file_path)
-
-        if not file_path.exists():
-            raise FileNotFoundError(
-                f"文件未找到: {file_path}\nFile not found: {file_path}"
-            )
-
-        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
-            logger.info(
-                f"正在读取 JSON 文件: {file_path}\nReading JSON file: {file_path}"
-            )
-            raw_data = await f.read()
-            data_list = json.loads(raw_data)
-
-        if not isinstance(data_list, list):
-            raise ValueError(
-                "JSON 文件内容应为列表格式 / JSON file content should be a list."
-            )
-
-        for data in data_list:
-            try:
-                yield ESSVariableData(**data)
-                logger.info(
-                    f"成功解析变量: {data.get('name', 'UNKNOWN')}\n"
-                    f"Successfully parsed variable: {data.get('name', 'UNKNOWN')}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"解析失败，跳过变量: {data.get('name', 'UNKNOWN')}，错误: {e}\n"
-                    f"Parsing failed, skipping variable: {data.get('name', 'UNKNOWN')}, error: {e}"
-                )
-                continue  # 跳过错误数据 / Skip invalid data
-
-    @staticmethod
-    @task(
-        cache_key_fn=task_input_hash,
-        retries=3,
-        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_expiration=timedelta(hours=1),
-        persist_result=True,
-        result_storage=LOCAL_STORAGE,
     )
     def compute_js_divergence(p: pl.Series, q: pl.Series) -> float:
         """
@@ -135,7 +79,6 @@ class ESSDivergenceCalculatorTask:
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
         persist_result=True,
-        result_storage=LOCAL_STORAGE,
     )
     def compute_js_series(
         distributions: Dict[Round, pl.Series],
