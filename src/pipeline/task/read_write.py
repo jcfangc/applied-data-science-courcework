@@ -5,7 +5,6 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, TypeVar
 
 import aiofiles
 from loguru import logger
-
 from prefect import task
 from prefect.tasks import task_input_hash
 
@@ -27,13 +26,9 @@ class ReadWriteTask:
     Read-write task class, including tasks for reading JSON files and persisting final results.
     """
 
-    @staticmethod
     @task(
-        cache_key_fn=task_input_hash,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_expiration=timedelta(hours=1),
-        persist_result=True,
     )
     async def save_causality_results_to_csv(
         result_generator: AsyncGenerator[ESSCausalityResult, None],
@@ -67,7 +62,7 @@ class ReadWriteTask:
                 )  # 写入 CSV 头 / Write CSV header
 
                 async for result in result_generator:
-                    logger.debug(f"正在写入结果: {result}")
+                    logger.debug(f"Result type: {type(result)} | Result: {result}")
                     row = result.serialize()
                     await f.write(",".join(map(str, row.values())) + "\n")
 
@@ -79,7 +74,6 @@ class ReadWriteTask:
             logger.error(f"写入 CSV 失败: {e}\nFailed to write CSV: {e}")
             raise e  # 让 Prefect 处理错误重试 / Let Prefect handle retries on failure
 
-    @staticmethod
     @task(
         cache_key_fn=task_input_hash,
         retries=3,
@@ -134,11 +128,8 @@ class ReadWriteTask:
                 continue  # 跳过错误数据 / Skip invalid data
 
     @task(
-        persist_result=True,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     async def cache_async_generator(
         generator: AsyncGenerator[T, None],

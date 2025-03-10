@@ -1,13 +1,14 @@
+import asyncio
 from datetime import timedelta
 from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable, Dict, List, Tuple
 
 import numpy as np
 from loguru import logger
-from statsmodels.tsa.stattools import grangercausalitytests
-
 from prefect import task
 from prefect.tasks import task_input_hash
+from statsmodels.tsa.stattools import grangercausalitytests
+from tqdm.asyncio import tqdm
 
 from ...definition.enum.causality_computation_status import CausalityComputationStatus
 from ...definition.p_model.causality_adjacency_matrix import CausalityAdjacencyMatrix
@@ -31,7 +32,6 @@ class ESSCausalityCalculatorTask:
     sorting a list of ESSSingleDivergences and sorting the divergence list within an ESSVariableDivergences object.
     """
 
-    @staticmethod
     @task(
         cache_key_fn=task_input_hash,
         cache_expiration=timedelta(hours=1),
@@ -79,7 +79,6 @@ class ESSCausalityCalculatorTask:
 
         return sorted_divs
 
-    @staticmethod
     @task(
         cache_key_fn=task_input_hash,
         cache_expiration=timedelta(hours=1),
@@ -129,7 +128,6 @@ class ESSCausalityCalculatorTask:
             divergences=sorted_divs,
         )
 
-    @staticmethod
     @task(
         persist_result=True,
         retries=3,
@@ -164,13 +162,12 @@ class ESSCausalityCalculatorTask:
 
         return p_value_a2b, p_value_b2a
 
-    @staticmethod
     @task(
         persist_result=True,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        # cache_key_fn=task_input_hash,
-        # cache_expiration=timedelta(hours=1),
+        cache_key_fn=task_input_hash,
+        cache_expiration=timedelta(hours=1),
     )
     def compute_causal_relationship(
         variable_a: ESSVariableDivergences,
@@ -258,13 +255,9 @@ class ESSCausalityCalculatorTask:
             ),
         )
 
-    @staticmethod
     @task(
-        persist_result=False,  # 仅流式返回，由 Flow 负责存储
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     async def compute_causal_relationship_from_adjacency(
         adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],
@@ -279,82 +272,98 @@ class ESSCausalityCalculatorTask:
         从邻接表提取变量对，并计算因果关系，避免重复计算。
         Extracts variable pairs from adjacency matrix and computes causality, avoiding redundant computations.
 
-        :param adjacency_matrices: 因果邻接表字典，包含 `country -> adjacency matrix`。
-                                   Dictionary mapping `country -> adjacency matrix`.
-        :param adjacency_entries_generator: 邻接表条目流，包含 `(country, var1, var2, status)`。
-                                           Adjacency matrix entry stream containing `(country, var1, var2, status)`.
+        :param adjacency_matrices: 因果邻接表字典，包含 country -> adjacency matrix。
+                                   Dictionary mapping country -> adjacency matrix.
+        :param adjacency_entries_generator: 邻接表条目流，包含 (country, var1, var2, status)。
+                                           Adjacency matrix entry stream containing (country, var1, var2, status).
         :param js_divergence_cache_file: 缓存文件路径，用于重新加载JS散度数据生成器。
                                          Cache file path used to reload JS divergence data generator.
         :param deserialize_fn: 异步反序列化函数。
                                Asynchronous deserialization function.
-        :param maxlag: Granger 滞后阶数，默认 `2`。
-                       Granger test max lag, default is `2`.
-        :yield: `ESSCausalityResult`，包含 `country, var1, var2, p_value`。
-                Yields `ESSCausalityResult`, containing `country, var1, var2, p_value`.
+        :param maxlag: Granger 滞后阶数，默认 2。
+                       Granger test max lag, default is 2.
+        :yield: ESSCausalityResult，包含 country, var1, var2, p_value。
+                Yields ESSCausalityResult, containing country, var1, var2, p_value.
         """
+        # 计算邻接矩阵条目总数（如果 adjacency_entries_generator 是一次性流，需提前计算）
+        # Calculate total number of adjacency matrix entries (if adjacency_entries_generator is a one-time stream, must calculate in advance)
 
-        async for country, var1, var2, status in adjacency_entries_generator:
-            if status != CausalityComputationStatus.PENDING:
-                continue  # 只处理 PENDING 状态的变量对
+        # 预先加载异步生成器，存入缓存
+        js_divergence_cache: Dict[Tuple[str, str], ESSVariableDivergences] = {}
 
-            logger.info(
-                f"提取 {country} 变量 {var1} 和 {var2} 进行因果分析。\n"
-                f"Extracting {var1} and {var2} from {country} for causality analysis."
+        async for js_data in ReadWriteTask.load_async_generator_from_cache(
+            deserialize_fn=deserialize_fn,
+            cache_file=js_divergence_gen_cache_file,
+        ):
+            js_data: ESSVariableDivergences
+            js_divergence_cache[(js_data.country, js_data.name)] = js_data
+
+        total_entries = await asyncio.to_thread(
+            lambda: sum(
+                sum(len(sub_dict) for sub_dict in matrix.adjacency_matrix.values())
+                for matrix in adjacency_matrices.values()
             )
+        )
+        logger.info(f"邻接表总条目数: {total_entries}")
 
-            # 每次都从缓存重新加载生成器，确保可重复消费
-            js_divergence_generator: AsyncGenerator[ESSVariableDivergences, None] = (
-                ReadWriteTask.load_async_generator_from_cache(
-                    deserialize_fn=deserialize_fn,
-                    cache_file=js_divergence_gen_cache_file,
+        # 限制并行计算的最大任务数
+        SEMAPHORE = asyncio.Semaphore(10)  # 控制最多 10 个并行计算任务
+        tasks = []  # 存储所有异步任务
+
+        async def process_causality(country, var1, var2):
+            """并行计算因果关系的子任务"""
+            async with SEMAPHORE:
+                variable_a = js_divergence_cache.get((country, var1))
+                variable_b = js_divergence_cache.get((country, var2))
+
+                if not variable_a or not variable_b:
+                    logger.warning(f"缺失 {country} 的变量数据: {var1}, {var2}，跳过。")
+                    return None  # 跳过计算
+
+                # 更新邻接表状态
+                await adjacency_matrices[country].update_status(
+                    var1, var2, CausalityComputationStatus.IN_PROGRESS
                 )
-            )
 
-            variable_a, variable_b = None, None
-            async for js_data in js_divergence_generator:
-                if js_data.country == country and js_data.name == var1:
-                    variable_a = js_data
-                elif js_data.country == country and js_data.name == var2:
-                    variable_b = js_data
-                if variable_a and variable_b:
-                    break  # 找到两个变量，停止遍历
-
-            if not variable_a or not variable_b:
-                logger.warning(
-                    f"缺失 {country} 的变量数据: {var1}, {var2}，跳过。\n"
-                    f"Missing variable data for {country}: {var1}, {var2}, skipping."
+                # 后台线程计算（避免阻塞事件循环）
+                result_a2b, result_b2a = await asyncio.to_thread(
+                    ESSCausalityCalculatorTask.compute_causal_relationship,
+                    variable_a=variable_a,
+                    variable_b=variable_b,
+                    maxlag=maxlag,
                 )
-                continue
 
-            logger.info("1")
+                result_a2b: ESSCausalityResult
+                result_b2a: ESSCausalityResult
+                logger.info(
+                    f"因果关系计算完成：{result_a2b.country} {result_a2b.causality_from} → {result_a2b.causality_to}，"
+                    f"p-value = {result_a2b.p_value}"
+                    f"因果关系计算完成：{result_b2a.country} {result_b2a.causality_from} → {result_b2a.causality_to}，"
+                    f"p-value = {result_b2a.p_value}"
+                )
 
-            # 更新邻接表状态 / Update adjacency matrix status
-            await adjacency_matrices[country].update_status(
-                var1, var2, CausalityComputationStatus.IN_PROGRESS
-            )
+                # 更新邻接表状态
+                await adjacency_matrices[country].update_status(
+                    var1, var2, CausalityComputationStatus.SUCCESS
+                )
 
-            logger.info("2")
+                return result_a2b, result_b2a
 
-            # 调用 `compute_causal_relationship` 计算因果关系 / Call `compute_causal_relationship` to compute causality
-            result_a, result_b = ESSCausalityCalculatorTask.compute_causal_relationship(
-                variable_a=variable_a,
-                variable_b=variable_b,
-                maxlag=maxlag,
-            )
+        # 创建任务（异步并行执行）
+        async for country, var1, var2, status in tqdm(
+            adjacency_entries_generator,
+            total=total_entries,
+            desc="Processing causality",
+        ):
+            if status == CausalityComputationStatus.PENDING:
+                task = asyncio.create_task(process_causality(country, var1, var2))
+                tasks.append(task)
 
-            logger.info(
-                f"计算完成 {result_a.causality_from} → {result_a.causality_to} (p={result_a.p_value})\n"
-                f"计算完成 {result_b.causality_from} → {result_b.causality_to} (p={result_b.p_value})\n"
-                f"Completed causality computation {result_a.causality_from} → {result_a.causality_to} (p={result_a.p_value})\n"
-                f"Completed causality computation {result_b.causality_from} → {result_b.causality_to} (p={result_b.p_value})"
-            )
+        # 等待所有任务完成
+        results = await asyncio.gather(*tasks)
 
-            # 更新邻接表状态 / Update adjacency matrix status
-            await adjacency_matrices[country].update_status(
-                var1, var2, CausalityComputationStatus.SUCCESS
-            )
-
-            logger.info("3")
-
-            yield result_a
-            yield result_b
+        # 过滤 None 值并 yield 结果
+        for result in results:
+            if result:
+                yield result[0]
+                yield result[1]

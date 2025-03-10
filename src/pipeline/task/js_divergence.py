@@ -1,15 +1,12 @@
-import json
+import asyncio
 from datetime import timedelta
-from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional
 
-import aiofiles
 import polars as pl
 from loguru import logger
-from scipy.spatial.distance import jensenshannon
-
 from prefect import task
 from prefect.tasks import task_input_hash
+from scipy.spatial.distance import jensenshannon
 
 from ...definition.enum.round import Round
 from ...definition.p_model.ess_divergence import (
@@ -30,7 +27,6 @@ class ESSDivergenceCalculatorTask:
     across different rounds in the ESS dataset.
     """
 
-    @staticmethod
     @task(
         cache_key_fn=task_input_hash,
         retries=3,
@@ -72,7 +68,6 @@ class ESSDivergenceCalculatorTask:
         logger.info("Completed compute_js_divergence: result = {result}", result=result)
         return result
 
-    @staticmethod
     @task(
         cache_key_fn=task_input_hash,
         cache_expiration=timedelta(hours=1),
@@ -164,18 +159,15 @@ class ESSDivergenceCalculatorTask:
 
         return js_results
 
-    @staticmethod
     @task(
-        persist_result=False,  # 流式返回不直接持久化，由 Flow 负责消费
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     async def compute_js_batch(
         generator: AsyncGenerator[ESSVariableData, None],
         target_name: Optional[str] = None,
         target_country: Optional[str] = None,
+        batch_size: int = 10,
     ) -> AsyncGenerator[ESSVariableDivergences, None]:
         """
         计算多个变量的 JS 散度，并根据 `target_name` 和 `target_country` 进行筛选。
@@ -187,22 +179,49 @@ class ESSDivergenceCalculatorTask:
                             Target variable name, optional. If provided, only return results for this variable.
         :param target_country: 目标国家，可选，若提供则仅返回该国家的数据
                             Target country, optional. If provided, only return results for this country.
+        :param batch_size: 批次大小，用于并行处理数据
+                            Batch size for parallel processing of data.
         :yield: 满足筛选条件的 ESSVariableDivergences 对象
                 Yields `ESSVariableDivergences` objects matching the filtering criteria.
         """
+
+        # 内部函数：并行处理一批数据
+        async def process_batch(
+            batch: list[ESSVariableData],
+        ) -> list[ESSVariableDivergences]:
+            results = await asyncio.gather(
+                *[
+                    asyncio.to_thread(
+                        ESSDivergenceCalculatorTask.compute_js_series,
+                        data.distributions,
+                    )
+                    for data in batch
+                ]
+            )
+            return [
+                ESSVariableDivergences(
+                    name=data.name, country=data.country, divergences=js_series
+                )
+                for data, js_series in zip(batch, results)
+            ]
+
+        batch: list[ESSVariableData] = []
         async for ess_data in generator:
-            # **筛选符合 `target_name` 和 `target_country` 的数据**
+            # 筛选符合条件的数据
             if target_name and ess_data.name != target_name:
                 continue
             if target_country and ess_data.country != target_country:
                 continue
 
-            # 计算 JS 散度序列
-            js_series = ESSDivergenceCalculatorTask.compute_js_series(
-                ess_data.distributions
-            )
+            batch.append(ess_data)
+            if len(batch) >= batch_size:
+                divergences_list = await process_batch(batch)
+                for divergence in divergences_list:
+                    yield divergence
+                batch = []  # 清空当前批次
 
-            # 生成符合筛选条件的结果
-            yield ESSVariableDivergences(
-                name=ess_data.name, country=ess_data.country, divergences=js_series
-            )
+        # 处理剩余不足一个批次的数据
+        if batch:
+            divergences_list = await process_batch(batch)
+            for divergence in divergences_list:
+                yield divergence

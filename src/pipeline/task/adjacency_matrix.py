@@ -6,6 +6,7 @@ from loguru import logger
 from prefect import task
 from prefect.tasks import task_input_hash
 
+from ...definition.const.core import ADJACENCY_MATRIX_DIR  # 缓存目录
 from ...definition.enum.causality_computation_status import CausalityComputationStatus
 from ...definition.p_model.causality_adjacency_matrix import CausalityAdjacencyMatrix
 from ...definition.p_model.ess_divergence import (
@@ -23,9 +24,7 @@ class AdjacencyMatrixTask:
     Causality adjacency matrix task class, which includes tasks to build causality adjacency matrices
     """
 
-    @staticmethod
     @task(
-        persist_result=True,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
     )
@@ -54,7 +53,7 @@ class AdjacencyMatrixTask:
         adjacency_matrices = {}
         for country, variables in country_to_variables.items():
             adjacency_matrices[country] = await CausalityAdjacencyMatrix.initialize(
-                list(variables)
+                variables=list(variables), persist_path=ADJACENCY_MATRIX_DIR
             )
 
         logger.info(
@@ -64,7 +63,6 @@ class AdjacencyMatrixTask:
 
         return adjacency_matrices
 
-    @staticmethod
     @task(
         persist_result=True,
         retries=3,

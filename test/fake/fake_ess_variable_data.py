@@ -130,7 +130,7 @@ def generate_fake_ess_variable_data_list(
 if __name__ == "__main__":
     # 生成一个测试用 JSON
     fake_data_json = generate_fake_ess_variable_data_list(
-        count=5, round_range_pct=(0, 1)
+        count=20, round_range_pct=(0, 1)
     )
 
     # 保存到文件
