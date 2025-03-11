@@ -1,11 +1,4 @@
 country,causality_from,causality_to,p_value
-UK,Republican,collection,0.02048513789808799
-UK,collection,Republican,0.382050899197232
-UK,Republican,culture,0.5154665929821204
-UK,culture,Republican,0.12316862517603895
-UK,Republican,degree,0.4811170510263653
-UK,degree,Republican,0.4394516337264336
-UK,Republican,feeling,0.9508515177291351
 UK,feeling,Republican,0.7794194155066414
 UK,Republican,focus,0.9550753012931357
 UK,focus,Republican,0.2737928866786491
@@ -345,6 +338,14 @@ UK,perhaps,suffer,0.32402193420173325
 UK,suffer,perhaps,0.2003487639870502
 UK,perhaps,support,0.09574084102523372
 UK,support,perhaps,0.8199135126962033
+UK,Republican,collection,0.02048513789808799
+UK,collection,Republican,0.382050899197232
+UK,Republican,culture,0.5154665929821204
+UK,culture,Republican,0.12316862517603895
+UK,Republican,degree,0.4811170510263653
+UK,degree,Republican,0.4394516337264336
+UK,Republican,feeling,0.9508515177291351
+UK,feeling,Republican,0.7794194155066414
 UK,perhaps,to,0.8302861585137067
 UK,to,perhaps,0.3302313604955757
 UK,perhaps,where,0.15624491987653827

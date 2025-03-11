@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import List
 
 from prefect import flow
 
@@ -24,21 +25,24 @@ async def causality_analysis_flow(
     # Step 1: Load JSON data
     ess_data_generator = ReadWriteTask.load_from_json(file_path=json_file)
 
-    # Step 2: 计算 JS 散度批次
-    # Step 2: Compute JS divergence batch
-    js_divergence_generator = ESSDivergenceCalculatorTask.compute_js_batch(
-        generator=ess_data_generator,
-    )
+    # 如果 JS 散度缓存文件不存在或为空，则重新计算
+    # Recompute if JS divergence cache file does not exist or is empty
+    if not js_cache_file.exists() or js_cache_file.stat().st_size == 0:
+        # Step 2: 计算 JS 散度批次
+        # Step 2: Compute JS divergence batch
+        js_divergence_generator = ESSDivergenceCalculatorTask.compute_js_batch(
+            generator=ess_data_generator,
+        )
 
-    # Step 3: 缓存 JS 散度结果到文件
-    # Step 3: Cache JS divergence results to file
-    await ReadWriteTask.cache_async_generator(
-        generator=js_divergence_generator,
-        serialize_fn=lambda data: asyncio.to_thread(
-            ESSVariableDivergences.serialize, data
-        ),
-        cache_file=js_cache_file,
-    )
+        # Step 3: 缓存 JS 散度结果到文件
+        # Step 3: Cache JS divergence results to file
+        await ReadWriteTask.cache_async_generator(
+            generator=js_divergence_generator,
+            serialize_fn=lambda data: asyncio.to_thread(
+                ESSVariableDivergences.serialize, data
+            ),
+            cache_file=js_cache_file,
+        )
 
     # Step 4: 从缓存加载 JS 散度数据
     # Step 4: Load JS divergence data from cache
@@ -49,10 +53,14 @@ async def causality_analysis_flow(
         cache_file=js_cache_file,
     )
 
+    js_divergences_list: List[ESSVariableDivergences] = [
+        js_divergence async for js_divergence in js_divergence_cached_generator
+    ]
+
     # Step 5: 构建因果邻接表
     # Step 5: Build causality adjacency matrices
     adjacency_matrices = await AdjacencyMatrixTask.build_causality_adjacency_matrices(
-        generator=js_divergence_cached_generator
+        divergences_list=js_divergences_list
     )
 
     # Step 6: 提取邻接表中的计算条目
@@ -61,24 +69,22 @@ async def causality_analysis_flow(
         adjacency_matrices=adjacency_matrices
     )
 
+    # 生成动态文件名（在原文件名后追加 "_lag{maxlag}.csv"）
+    # Generate dynamic file name (append "_lag{maxlag}.csv" to the original file name)
+    causality_results_csv = causality_results_csv.with_stem(
+        causality_results_csv.stem + f"_lag{maxlag}"
+    )
+
     # Step 7: 根据邻接表计算因果关系
     # Step 7: Compute causality relationships based on adjacency matrices
     causality_result_generator = (
         ESSCausalityCalculatorTask.compute_causal_relationship_from_adjacency(
             adjacency_matrices=adjacency_matrices,
             adjacency_entries_generator=adjacency_entries_generator,
-            js_divergence_gen_cache_file=js_cache_file,
-            deserialize_fn=lambda data: asyncio.to_thread(
-                ESSVariableDivergences.model_validate, data
-            ),
+            divergences_list=js_divergences_list,
+            output_csv=causality_results_csv,
             maxlag=maxlag,
         )
-    )
-
-    # 生成动态文件名（在原文件名后追加 "_lag{maxlag}.csv"）
-    # Generate dynamic file name (append "_lag{maxlag}.csv" to the original file name)
-    causality_results_csv = causality_results_csv.with_stem(
-        causality_results_csv.stem + f"_lag{maxlag}"
     )
 
     # Step 8: 保存因果分析结果到 CSV 文件

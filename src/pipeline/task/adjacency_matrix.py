@@ -1,8 +1,7 @@
 from datetime import timedelta
-from typing import AsyncGenerator, Dict, Set, Tuple
+from typing import AsyncGenerator, Dict, List, Set, Tuple
 
 from loguru import logger
-
 from prefect import task
 from prefect.tasks import task_input_hash
 
@@ -29,22 +28,22 @@ class AdjacencyMatrixTask:
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
     )
     async def build_causality_adjacency_matrices(
-        generator: AsyncGenerator[ESSVariableDivergences, None],
+        divergences_list: List[ESSVariableDivergences],
     ) -> Dict[str, CausalityAdjacencyMatrix]:
         """
         组装因果邻接表，返回每个国家对应的 CausalityAdjacencyMatrix。
         Build causality adjacency matrices and return a dictionary mapping
         each country to its corresponding `CausalityAdjacencyMatrix`.
 
-        :param generator: 异步生成器，逐步提供 ESSVariableDivergences 数据
-                        Asynchronous generator yielding ESSVariableDivergences objects.
+        :param divergences_list: 数据列表步提供 ESSVariableDivergences 数据
+                                A list of ESSVariableDivergences data.
         :return: 每个国家对应的因果邻接表 (Dict[str, CausalityAdjacencyMatrix])
                 A dictionary mapping each country to its causality adjacency matrix.
         """
 
         # 按国家分类变量 / Group variables by country.
         country_to_variables: Dict[str, Set] = {}
-        async for item in generator:
+        for item in divergences_list:
             if item.country not in country_to_variables:
                 country_to_variables[item.country] = set()
             country_to_variables[item.country].add(item.name)

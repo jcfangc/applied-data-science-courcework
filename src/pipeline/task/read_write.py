@@ -1,7 +1,18 @@
+import csv
 import json
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, TypeVar
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Set,
+    Tuple,
+    TypeVar,
+)
 
 import aiofiles
 from loguru import logger
@@ -30,17 +41,52 @@ class ReadWriteTask:
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
     )
+    async def load_existing_causality_results(
+        output_csv: Path,
+    ) -> Set[Tuple[str, str, str]]:
+        """
+        异步读取 CSV 结果文件，并提取已计算的因果关系数据。
+
+        :param output_csv: CSV 结果文件的路径。
+        :return: 已计算因果关系的集合，格式为 (country, var1, var2)。
+        """
+        existing_results: Set[Tuple[str, str, str]] = set()
+
+        logger.info(f"正在加载已有因果关系数据: {output_csv}")
+
+        if output_csv.exists() and output_csv.stat().st_size > 0:
+            async with aiofiles.open(output_csv, mode="r", encoding="utf-8") as f:
+                content = await f.readlines()  # 读取所有行
+                reader = csv.reader(content)  # 用 csv.reader 解析行
+
+                header_skipped = False
+                for row in reader:
+                    logger.debug(f"解析行: {row}")
+                    if not header_skipped:
+                        header_skipped = True  # 跳过第一行
+                        continue
+
+                    if len(row) >= 3:
+                        existing_results.add((row[0], row[1], row[2]))
+
+        logger.info(f"已加载 {len(existing_results)} 条因果关系数据")
+        return existing_results
+
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
     async def save_causality_results_to_csv(
         result_generator: AsyncGenerator[ESSCausalityResult, None],
         output_path: str | Path = CAUSALITY_DIR / "causality_results.csv",
     ):
         """
-        异步任务：将 `ESSCausalityResult` 结果持久化到 CSV 文件。
-        Asynchronous task: Persist `ESSCausalityResult` results to a CSV file.
+        异步任务：将 `ESSCausalityResult` 结果追加保存到 CSV 文件。
+        Asynchronous task: Append `ESSCausalityResult` results to a CSV file.
 
         :param result_generator: `AsyncGenerator[ESSCausalityResult, None]`
-                                    逐个提供因果分析结果的异步生成器。
-                                    An asynchronous generator yielding causality analysis results.
+                                逐个提供因果分析结果的异步生成器。
+                                An asynchronous generator yielding causality analysis results.
         :param output_path: `str | Path`
                             输出 CSV 文件路径。
                             The path to the output CSV file.
@@ -53,13 +99,16 @@ class ReadWriteTask:
         # 定义 CSV 文件的列名 / Define CSV column names
         fieldnames = ["country", "causality_from", "causality_to", "p_value"]
 
+        # 检查文件是否已存在（避免重复写入表头）
+        file_exists = output_path.exists() and output_path.stat().st_size > 0
+
         try:
             async with aiofiles.open(
-                output_path, mode="w", encoding="utf-8", newline=""
+                output_path, mode="a", encoding="utf-8", newline=""
             ) as f:
-                await f.write(
-                    ",".join(fieldnames) + "\n"
-                )  # 写入 CSV 头 / Write CSV header
+                # 只有在文件不存在时才写入 CSV 头 / Write header only if file doesn't exist
+                if not file_exists:
+                    await f.write(",".join(fieldnames) + "\n")
 
                 async for result in result_generator:
                     logger.debug(f"Result type: {type(result)} | Result: {result}")
@@ -67,11 +116,11 @@ class ReadWriteTask:
                     await f.write(",".join(map(str, row.values())) + "\n")
 
             logger.info(
-                f"因果分析结果已成功保存至 {output_path}\nCausality analysis results successfully saved to {output_path}"
+                f"因果分析结果已追加保存至 {output_path}\nCausality analysis results successfully appended to {output_path}"
             )
 
         except Exception as e:
-            logger.error(f"写入 CSV 失败: {e}\nFailed to write CSV: {e}")
+            logger.error(f"❌ 写入 CSV 失败: {e}\nFailed to write CSV: {e}")
             raise e  # 让 Prefect 处理错误重试 / Let Prefect handle retries on failure
 
     @task(

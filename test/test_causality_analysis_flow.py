@@ -26,11 +26,11 @@ async def test_causality_analysis_flow():
         causality_csv_file.stem + f"_lag{maxlag}"
     )
 
-    # 如果目标文件已存在，先删除（避免测试受上次结果影响）
-    if final_causality_csv_file.exists():
-        final_causality_csv_file.unlink()
-    if js_cache_file.exists():
-        js_cache_file.unlink()
+    # # 如果目标文件已存在，先删除（避免测试受上次结果影响）
+    # if final_causality_csv_file.exists():
+    #     final_causality_csv_file.unlink()
+    # if js_cache_file.exists():
+    #     js_cache_file.unlink()
 
     # 调用 flow 执行任务
     await causality_analysis_flow(
