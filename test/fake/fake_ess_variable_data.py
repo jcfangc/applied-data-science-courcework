@@ -68,19 +68,20 @@ def generate_normalized_distribution(num_categories: int) -> List[float]:
 
 
 def generate_fake_ess_variable_data(
-    start_pct: Optional[float] = None, end_pct: Optional[float] = None
+    country: str, start_pct: Optional[float] = None, end_pct: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     生成符合 `ESSVariableData` 结构的假数据 JSON，并允许传入可选的起始和结束百分比来控制连续轮次下标。
     Generate fake JSON data compatible with `ESSVariableData`, with optional start and end percentages
     to control the indices for selecting a continuous block of rounds.
 
+    :param country: 国家代码 / Country code
     :param start_pct: 起始百分比（0 到 1），用于计算起始下标 / Start percentage (0 to 1)
     :param end_pct: 结束百分比（0 到 1），用于计算结束下标 / End percentage (0 to 1)
     :return: 假数据字典 / Fake data dictionary
     """
     name = fake.word()
-    country = "UK"
+    country = country
 
     # 生成 codelist (类别索引 -> 说明) / Generate codelist (category index -> label)
     num_categories = random.randint(2, 6)  # 2~6 个类别 / 2~6 categories
@@ -104,6 +105,7 @@ def generate_fake_ess_variable_data(
 
 
 def generate_fake_ess_variable_data_list(
+    country: str,
     count: int = 10,
     round_range_pct: Optional[Tuple[float, float]] = None,
 ) -> List[Dict[str, Any]]:
@@ -111,6 +113,7 @@ def generate_fake_ess_variable_data_list(
     生成包含多个 `ESSVariableData` 兼容的假数据的列表，并允许所有数据共享相同的轮次。
     Generate a list of fake JSON data compatible with `ESSVariableData`, allowing consistent rounds across all records.
 
+    :param country: 国家代码 / Country code
     :param count: 生成的数据条数 (默认 10)
                   Number of records to generate (default 10).
     :param round_range_pct: 可选的 (start_pct, end_pct) 范围，用百分比控制候选轮次在枚举中的起始结束位置，
@@ -121,18 +124,20 @@ def generate_fake_ess_variable_data_list(
     """
     return [
         generate_fake_ess_variable_data(
-            start_pct=round_range_pct[0], end_pct=round_range_pct[1]
+            country=country, start_pct=round_range_pct[0], end_pct=round_range_pct[1]
         )
         for _ in range(count)
     ]
 
 
 if __name__ == "__main__":
+    countries = ["UK", "FR"]
     # 生成一个测试用 JSON
-    fake_data_json = generate_fake_ess_variable_data_list(
-        count=20, round_range_pct=(0, 1)
-    )
+    for country in countries:
+        fake_data_json = generate_fake_ess_variable_data_list(
+            country=country, count=10, round_range_pct=(0, 1)
+        )
 
-    # 保存到文件
-    with open(FAKE_DATA_DIR / "fake_ess_variable_data.json", "w") as f:
-        json.dump(fake_data_json, f, indent=2)
+        # 保存到文件
+        with open(FAKE_DATA_DIR / f"{country}_variables.json", "w") as f:
+            json.dump(fake_data_json, f, indent=2)

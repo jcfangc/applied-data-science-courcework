@@ -19,7 +19,7 @@ from loguru import logger
 from prefect import task
 from prefect.tasks import task_input_hash
 
-from ...definition.const.core import CAUSALITY_DIR, DEFAULT_CACHE_FILE
+from ...definition.const.core import RESULT_DIR
 from ...definition.p_model.ess_causality import ESSCausalityResult
 from ...definition.p_model.ess_variable_data import ESSVariableData
 from ...util.backoff import BackoffStrategy
@@ -77,51 +77,36 @@ class ReadWriteTask:
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
     )
     async def save_causality_results_to_csv(
-        result_generator: AsyncGenerator[ESSCausalityResult, None],
-        output_path: str | Path = CAUSALITY_DIR / "causality_results.csv",
-    ):
+        results: List[ESSCausalityResult],
+        output_path: str | Path = RESULT_DIR / "causality_results.csv",
+    ) -> None:
         """
-        异步任务：将 `ESSCausalityResult` 结果追加保存到 CSV 文件。
-        Asynchronous task: Append `ESSCausalityResult` results to a CSV file.
+        将一批 ESSCausalityResult 结果追加保存到 CSV 文件。
 
-        :param result_generator: `AsyncGenerator[ESSCausalityResult, None]`
-                                逐个提供因果分析结果的异步生成器。
-                                An asynchronous generator yielding causality analysis results.
-        :param output_path: `str | Path`
-                            输出 CSV 文件路径。
-                            The path to the output CSV file.
+        :param results: ESSCausalityResult 的列表。
+        :param output_path: 输出 CSV 文件路径。
         """
         output_path = Path(output_path)
-        output_path.parent.mkdir(
-            parents=True, exist_ok=True
-        )  # 确保目录存在 / Ensure directory exists
-
-        # 定义 CSV 文件的列名 / Define CSV column names
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = ["country", "causality_from", "causality_to", "p_value"]
-
-        # 检查文件是否已存在（避免重复写入表头）
         file_exists = output_path.exists() and output_path.stat().st_size > 0
 
         try:
             async with aiofiles.open(
                 output_path, mode="a", encoding="utf-8", newline=""
             ) as f:
-                # 只有在文件不存在时才写入 CSV 头 / Write header only if file doesn't exist
+                # 如果文件不存在则写入表头
                 if not file_exists:
                     await f.write(",".join(fieldnames) + "\n")
-
-                async for result in result_generator:
-                    logger.debug(f"Result type: {type(result)} | Result: {result}")
+                for result in results:
                     row = result.serialize()
                     await f.write(",".join(map(str, row.values())) + "\n")
-
             logger.info(
                 f"因果分析结果已追加保存至 {output_path}\nCausality analysis results successfully appended to {output_path}"
             )
-
         except Exception as e:
             logger.error(f"❌ 写入 CSV 失败: {e}\nFailed to write CSV: {e}")
-            raise e  # 让 Prefect 处理错误重试 / Let Prefect handle retries on failure
+            raise e
 
     @task(
         cache_key_fn=task_input_hash,
@@ -183,7 +168,7 @@ class ReadWriteTask:
     async def cache_async_generator(
         generator: AsyncGenerator[T, None],
         serialize_fn: Callable[[T], Awaitable[dict]],
-        cache_file: str | Path = DEFAULT_CACHE_FILE,
+        cache_file: str | Path,
     ) -> Path:
         """
         将异步生成器中的数据缓存到 JSONL 文件中。\n
@@ -201,7 +186,7 @@ class ReadWriteTask:
         cache_file = Path(cache_file)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
 
-        async with aiofiles.open(cache_file, mode="w", encoding="utf-8") as f:
+        async with aiofiles.open(cache_file, mode="a", encoding="utf-8") as f:
             async for item in generator:
                 data_dict = await serialize_fn(item)
                 await f.write(json.dumps(data_dict) + "\n")
@@ -221,7 +206,7 @@ class ReadWriteTask:
     )
     async def load_async_generator_from_cache(
         deserialize_fn: Callable[[dict], Awaitable[T]],
-        cache_file: str | Path = DEFAULT_CACHE_FILE,
+        cache_file: str | Path,
     ) -> AsyncGenerator[T, None]:
         """
         从 JSONL 缓存文件恢复异步生成器。\n
@@ -251,3 +236,44 @@ class ReadWriteTask:
             f"已成功从缓存文件恢复数据: {cache_file}\n"
             f"Successfully restored data from cache file: {cache_file}"
         )
+
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
+    def extract_country_name(file_path: str) -> str:
+        """
+        从文件路径中提取国家名。
+
+        :param file_path: 形式为“xxx/xxx/国家名_variables.json”的文件路径
+        :return: 提取的国家名
+        """
+        path = Path(file_path)
+        filename = path.stem  # 获取文件名（不含后缀）
+
+        if "_variables" in filename:
+            return filename.replace("_variables", "")
+        else:
+            raise ValueError("文件名格式错误，应包含 '_variables.json'")
+
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
+    async def extract_countries_from_folder(
+        folder: Path | str,
+    ) -> AsyncGenerator[str, None]:
+        """
+        批量获取文件夹下所有 json 文件的国家名。
+
+        :param folder: 文件夹路径，支持 str 和 Path 类型
+        :yield: 国家名
+        """
+        folder_path = Path(folder)
+
+        for json_file in folder_path.glob("*.json"):  # 遍历文件夹下的所有 .json 文件
+            if json_file.is_file():
+                try:
+                    yield ReadWriteTask.extract_country_name(json_file)
+                except ValueError as e:
+                    logger.warning(f"跳过文件 {json_file.name}: {e}")

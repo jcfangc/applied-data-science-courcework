@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import polars as pl
 from pydantic import (
@@ -26,9 +26,9 @@ class ESSVariableData(BaseModel):
         min_length=1,
         description="变量分布所属的具体国家 / The specific country to which the variable distribution belongs",
     )
-    codelist: Dict[int, str] = Field(
-        ...,
-        description="变量的类别映射表 (整数索引 -> 选项说明) / Variable category mapping (int -> label)",
+    codelist: Optional[Dict[int, str]] = Field(
+        None,
+        description="变量的类别映射表 (整数索引 -> 选项说明)，可为空 / Variable category mapping (int -> label), can be empty",
     )
     distributions: Dict[Round, pl.Series] = Field(
         ...,
@@ -47,7 +47,7 @@ class ESSVariableData(BaseModel):
         return {
             "name": self.name,
             "country": self.country,
-            "codelist": self.codelist,
+            "codelist": self.codelist or {},  # 确保 codelist 是一个字典，即使为空
             "distributions": {
                 str(round_): dist.to_list()
                 for round_, dist in self.distributions.items()
@@ -91,22 +91,31 @@ class ESSVariableData(BaseModel):
         cls, value: Dict[Round, pl.Series], info: ValidationInfo
     ) -> Dict[Round, pl.Series]:
         """
-        确保所有 distributions 的 pl.Series 长度和 codelist 的长度一致
-        Ensure all pl.Series in distributions have the same length as codelist.
+        确保所有 `distributions` 的 `pl.Series` 长度一致。
+        1. 如果 `codelist` 存在，`distributions` 长度必须匹配 `codelist`。
+        2. 如果 `codelist` 为空，确保 `distributions` 内所有 `pl.Series` 长度一致。
+        Ensure all `pl.Series` in `distributions` have consistent length.
         """
-        codelist = info.data.get("codelist", {})
-        codelist_length: int = len(codelist)
+        codelist = info.data.get("codelist", None)
 
-        for round_key, series in value.items():
-            if not isinstance(series, pl.Series):
+        # 1️⃣ 获取第一个 `pl.Series` 作为标准长度
+        lengths = {len(series) for series in value.values()}
+
+        if len(lengths) > 1:
+            raise ValueError(
+                f"所有 distributions 的 `pl.Series` 长度必须一致，当前长度集合: {lengths} / "
+                f"All distributions `pl.Series` must have the same length, but found: {lengths}"
+            )
+
+        # 2️⃣ 如果 `codelist` 存在，检查 `pl.Series` 长度是否匹配 `codelist`
+        if codelist is not None:
+            codelist_length = len(codelist)
+            expected_length = next(iter(lengths))  # 获取第一个 `pl.Series` 长度
+
+            if codelist_length != expected_length:
                 raise ValueError(
-                    f"轮次 {round_key} 的分布必须是 polars.Series 类型 / "
-                    f"Distribution for round {round_key} must be of type polars.Series"
-                )
-            if len(series) != codelist_length:
-                raise ValueError(
-                    f"轮次 {round_key} 的分布长度 ({len(series)}) 与 codelist 长度 ({codelist_length}) 不匹配 / "
-                    f"Length of distribution for round {round_key} ({len(series)}) does not match codelist length ({codelist_length})"
+                    f"codelist 长度 ({codelist_length}) 与 `distributions` 长度 ({expected_length}) 不匹配 / "
+                    f"codelist length ({codelist_length}) does not match `distributions` length ({expected_length})"
                 )
 
         return value

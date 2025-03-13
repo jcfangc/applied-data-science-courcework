@@ -1,7 +1,7 @@
 import asyncio
 from datetime import timedelta
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from loguru import logger
@@ -312,76 +312,120 @@ class ESSCausalityCalculatorTask:
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
     )
-    async def compute_causal_relationship_from_adjacency(
-        adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],
-        adjacency_entries_generator: AsyncGenerator[
-            Tuple[str, str, str, CausalityComputationStatus], None
-        ],
-        divergences_list: List[ESSVariableDivergences],
-        output_csv: Path,
-        maxlag: int = 2,
-    ) -> AsyncGenerator[ESSCausalityResult, None]:
+    async def load_existing_results(output_csv: Path) -> Set[Tuple[str, str, str]]:
         """
-        从邻接表提取变量对，并计算因果关系，避免重复计算。
-        Extracts variable pairs from adjacency matrix and computes causality, avoiding redundant computations.
+        加载已计算的因果关系结果。
+        Load previously computed causality results.
 
-        :param adjacency_matrices: 因果邻接表字典，包含 country -> adjacency matrix。
-                                   Dictionary mapping country -> adjacency matrix.
-        :param adjacency_entries_generator: 邻接表条目流，包含 (country, var1, var2, status)。
-                                           Adjacency matrix entry stream containing (country, var1, var2, status).
-        :param divergences_list: ESSVariableDivergences 列表，包含所有变量的 JS 散度数据。
-                                    List of ESSVariableDivergences containing JS divergence data for all variables.
-        :param output_csv: 输出 CSV 文件路径，用于保存计算结果。
-                            Output CSV file path for saving computation results.
-        :param maxlag: Granger 滞后阶数，默认 2。
-                       Granger test max lag, default is 2.
-        :yield: ESSCausalityResult，包含 country, var1, var2, p_value。
-                Yields ESSCausalityResult, containing country, var1, var2, p_value.
+        :param output_csv: 输出 CSV 文件路径。
+                            Output CSV file path.
+        :return: 已计算结果的集合，格式为 (country, var1, var2)。
+                Set of previously computed results, formatted as (country, var1, var2).
         """
-        if not divergences_list:
-            logger.warning("❌ divergences_list 为空，因果关系计算无法进行！")
-            return
-
-        existing_results = await ReadWriteTask.load_existing_causality_results(
-            output_csv
-        )
+        existing_results: Set[
+            Tuple[str, str, str]
+        ] = await ReadWriteTask.load_existing_causality_results(output_csv)
         logger.info(
-            f"✅ 已加载 {len(existing_results)} 个计算过的因果关系，避免重复计算."
-            f"✅ Loaded {len(existing_results)} computed causality relationships, avoiding redundant computations."
+            f"✅ 已加载 {len(existing_results)} 个计算过的因果关系，避免重复计算.\n"
+            f"✅ Successfully loaded {len(existing_results)} previously computed causality relationships, avoiding duplicate computations."
         )
+        return existing_results
 
-        # 从缓存加载 JS 散度数据
-        js_divergence_cache: Dict[Tuple[str, str], ESSVariableDivergences] = {
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
+    def build_js_divergence_cache(
+        divergences_list: List[ESSVariableDivergences],
+    ) -> Dict[Tuple[str, str], ESSVariableDivergences]:
+        """
+        构建 JS 散度数据的缓存字典。
+        Construct a cache dictionary for JS divergence data.
+
+        :param divergences_list: ESSVariableDivergences 列表。
+                                List of ESSVariableDivergences.
+        :return: 以 (country, variable_name) 为键的 JS 散度数据字典。
+                JS divergence data dictionary with (country, variable_name) as key.
+        """
+        cache: Dict[Tuple[str, str], ESSVariableDivergences] = {
             (js_data.country, js_data.name): js_data for js_data in divergences_list
         }
-
         logger.info(
-            f"成功加载 {len(js_divergence_cache)} 个 JS 散度数据 / Successfully loaded {len(js_divergence_cache)} JS divergence data."
+            f"成功加载 {len(cache)} 个 JS 散度数据 / Successfully loaded {len(cache)} JS divergence data."
         )
+        return cache
 
-        # 计算邻接矩阵条目总数（如果 adjacency_entries_generator 是一次性流，需提前计算）
-        # Calculate total number of adjacency matrix entries (if adjacency_entries_generator is a one-time stream, must calculate in advance)
-        total_entries = await asyncio.to_thread(
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
+    async def calculate_total_entries(
+        adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],
+    ) -> int:
+        """
+        计算所有邻接矩阵中条目的总数。
+        Calculate the total number of entries in all adjacency matrices.
+
+        :param adjacency_matrices: country -> adjacency matrix 的字典。
+                                    Dictionary mapping country to adjacency matrix.
+        :return: 邻接条目的总数。
+                Total number of adjacency entries.
+        """
+        return await asyncio.to_thread(
             lambda: sum(
                 sum(len(sub_dict) for sub_dict in matrix.adjacency_matrix.values())
                 for matrix in adjacency_matrices.values()
             )
         )
-        logger.info(f"邻接表总条目数: {total_entries}")
 
-        # 限制并行计算的最大任务数
-        semaphore = asyncio.Semaphore(10)  # 控制最多 10 个并行计算任务
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
+    async def create_causality_tasks(
+        adjacency_entries_generator: AsyncGenerator[
+            Tuple[str, str, str, CausalityComputationStatus], None
+        ],
+        total_entries: int,
+        existing_results: Set[Tuple[str, str, str]],
+        semaphore: asyncio.Semaphore,
+        js_divergence_cache: Dict[Tuple[str, str], ESSVariableDivergences],
+        adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],
+        maxlag: int,
+    ) -> List[asyncio.Task[Any]]:
+        """
+        遍历邻接条目流，创建待计算因果关系的异步任务列表。
+        Iterate over the adjacency entry stream and create a list of asynchronous tasks to compute causality relationships.
 
-        tasks = []  # 存储所有异步任务
-        # 创建任务（异步并行执行）
+        :param adjacency_entries_generator: 包含 (country, var1, var2, status) 的异步生成器。
+                                            Asynchronous generator containing (country, var1, var2, status).
+        :param total_entries: 邻接矩阵总条目数，用于进度显示。
+                                Total number of entries in the adjacency matrices, used for progress display.
+        :param existing_results: 已计算结果的集合。
+                                Set of previously computed results.
+        :param semaphore: 限制并行计算任务的信号量。
+                            Semaphore to limit parallel computation tasks.
+        :param js_divergence_cache: JS 散度数据缓存。
+                                    JS divergence data cache.
+        :param adjacency_matrices: 因果邻接矩阵字典。
+                                    Causality adjacency matrix dictionary.
+        :param maxlag: Granger 滞后阶数。
+                        Granger lag order.
+        :return: 异步任务列表。
+                Asynchronous task list.
+        """
+        tasks: List[asyncio.Task[Any]] = []
         async for country, var1, var2, status in tqdm(
             adjacency_entries_generator,
             total=total_entries,
             desc="Processing causality",
         ):
             if (country, var1, var2) in existing_results:
-                logger.info(f"⏭️ 结果已存在，跳过计算：{country} {var1} → {var2}")
-                continue  # 跳过已计算的条目 / Skip existing results
+                logger.info(
+                    f"⏭️ 结果已存在，跳过计算：{country} {var1} & {var2}\n"
+                    f"⏭️ Result already exists, skipping computation: {country} {var1} & {var2}"
+                )
+                continue
 
             if status == CausalityComputationStatus.PENDING:
                 task = asyncio.create_task(
@@ -396,12 +440,105 @@ class ESSCausalityCalculatorTask:
                     )
                 )
                 tasks.append(task)
+        return tasks
 
-        # 等待所有任务完成
-        results = await asyncio.gather(*tasks)
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
+    )
+    async def compute_causal_relationship_from_adjacency(
+        adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],
+        adjacency_entries_generator: AsyncGenerator[
+            Tuple[str, str, str, CausalityComputationStatus], None
+        ],
+        divergences_list: List[ESSVariableDivergences],
+        output_csv: Path,
+        maxlag: int = 2,
+        batch_size: int = 10,  # 定义每个持久化批次的大小
+    ) -> None:
+        """
+        从邻接表提取变量对，并计算因果关系，避免重复计算，
+        计算结果将分批持久化到 CSV 文件中。
+        Extract variable pairs from the adjacency matrices and compute causality relationships,
+        avoiding duplicate computations. Persist the results in batches to a CSV file.
 
-        # 过滤 None 值并 yield 结果
-        for result in results:
+        :param adjacency_matrices: 因果邻接表字典，包含 country -> adjacency matrix。
+                                    Causality adjacency matrix dictionary, containing country -> adjacency matrix.
+        :param adjacency_entries_generator: 邻接表条目流，包含 (country, var1, var2, status)。
+                                            Adjacency matrix entry stream, containing (country, var1, var2, status).
+        :param divergences_list: ESSVariableDivergences 列表，包含所有变量的 JS 散度数据。
+                                List of ESSVariableDivergences containing JS divergence data for all variables.
+        :param output_csv: 输出 CSV 文件路径，用于保存计算结果。
+                            Output CSV file path to save the computation results.
+        :param maxlag: Granger 滞后阶数，默认 2。
+                        Granger lag order, default is 2.
+        :param batch_size: 每个持久化批次处理的结果数量。
+                            Number of results processed in each persistence batch.
+        :return: None
+        """
+        if not divergences_list:
+            logger.warning(
+                "❌ divergences_list 为空，因果关系计算无法进行！\n"
+                "❌ divergences_list is empty, causality computation cannot proceed!"
+            )
+            return
+
+        # 加载已计算结果
+        # Load existing results
+        existing_results: Set[
+            Tuple[str, str, str]
+        ] = await ESSCausalityCalculatorTask.load_existing_results(output_csv)
+
+        # 加载已计算结果及构建 JS 散度缓存
+        # Load existing results and build JS divergence cache
+        js_divergence_cache: Dict[Tuple[str, str], ESSVariableDivergences] = (
+            ESSCausalityCalculatorTask.build_js_divergence_cache(divergences_list)
+        )
+
+        # 计算邻接矩阵条目总数
+        # Calculate the total number of entries in the adjacency matrices
+        total_entries: int = await ESSCausalityCalculatorTask.calculate_total_entries(
+            adjacency_matrices
+        )
+        logger.info(
+            f"邻接表总条目数: {total_entries}\n"
+            f"Total number of adjacency entries: {total_entries}"
+        )
+
+        # 限制并行计算的最大任务数
+        # Limit the maximum number of parallel tasks
+        semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+
+        # 创建待执行的计算任务
+        # Create tasks to be executed
+        tasks: List[
+            asyncio.Task[Any]
+        ] = await ESSCausalityCalculatorTask.create_causality_tasks(
+            adjacency_entries_generator=adjacency_entries_generator,
+            total_entries=total_entries,
+            existing_results=existing_results,
+            semaphore=semaphore,
+            js_divergence_cache=js_divergence_cache,
+            adjacency_matrices=adjacency_matrices,
+            maxlag=maxlag,
+        )
+
+        # 使用 asyncio.as_completed 实时处理任务结果，并按批次持久化保存
+        # Process task results in real-time using asyncio.as_completed and persist in batches
+        batch: List[ESSCausalityResult] = []
+        for completed_task in asyncio.as_completed(tasks):
+            result: Optional[
+                Tuple[ESSCausalityResult, ESSCausalityResult]
+            ] = await completed_task
             if result:
-                yield result[0]
-                yield result[1]
+                # 添加返回的两个 ESSCausalityResult 到当前批次
+                # Add the two returned ESSCausalityResults to the current batch
+                batch.extend(result)
+            if len(batch) >= batch_size:
+                await ReadWriteTask.save_causality_results_to_csv(batch, output_csv)
+                batch = []  # 重置批次 / Reset batch
+
+        # 持久化剩余不足一个批次的结果
+        # Persist the remaining results that do not form a full batch
+        if batch:
+            await ReadWriteTask.save_causality_results_to_csv(batch, output_csv)
