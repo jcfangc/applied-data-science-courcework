@@ -1,6 +1,5 @@
 import csv
 import json
-from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -17,7 +16,6 @@ from typing import (
 import aiofiles
 from loguru import logger
 from prefect import task
-from prefect.tasks import task_input_hash
 
 from ...definition.const.core import RESULT_DIR
 from ...definition.p_model.ess_causality import ESSCausalityResult
@@ -109,11 +107,8 @@ class ReadWriteTask:
             raise e
 
     @task(
-        cache_key_fn=task_input_hash,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_expiration=timedelta(hours=1),
-        persist_result=True,
     )
     async def load_from_json(
         file_path: str | Path,
@@ -185,6 +180,7 @@ class ReadWriteTask:
         """
         cache_file = Path(cache_file)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.touch(exist_ok=True)
 
         async with aiofiles.open(cache_file, mode="a", encoding="utf-8") as f:
             async for item in generator:
@@ -198,11 +194,8 @@ class ReadWriteTask:
         return cache_file
 
     @task(
-        persist_result=False,  # 流式返回 / Streamed output
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     async def load_async_generator_from_cache(
         deserialize_fn: Callable[[dict], Awaitable[T]],

@@ -38,3 +38,6 @@ prefect/
 secrets.json
 *.key
 *.pem
+
+# 测试缓存 / Test cache
+.pytest_cache/

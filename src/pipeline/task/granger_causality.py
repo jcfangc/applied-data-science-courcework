@@ -1,12 +1,10 @@
 import asyncio
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from loguru import logger
 from prefect import task
-from prefect.tasks import task_input_hash
 from statsmodels.tsa.stattools import grangercausalitytests
 from tqdm.asyncio import tqdm
 
@@ -33,11 +31,8 @@ class ESSCausalityCalculatorTask:
     """
 
     @task(
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        persist_result=True,
     )
     def sort_divergences(
         divergences: List[ESSSingleDivergence],
@@ -80,11 +75,8 @@ class ESSCausalityCalculatorTask:
         return sorted_divs
 
     @task(
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        persist_result=True,
     )
     def sort_variable_divergence(
         ess_variable_divergences: ESSVariableDivergences,
@@ -129,11 +121,8 @@ class ESSCausalityCalculatorTask:
         )
 
     @task(
-        persist_result=True,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     def bidirectional_granger_test(
         js_a: np.ndarray, js_b: np.ndarray, maxlag: int
@@ -163,11 +152,8 @@ class ESSCausalityCalculatorTask:
         return p_value_a2b, p_value_b2a
 
     @task(
-        persist_result=True,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     def compute_causal_relationship(
         variable_a: ESSVariableDivergences,

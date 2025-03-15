@@ -1,9 +1,7 @@
-from datetime import timedelta
 from typing import AsyncGenerator, Dict, List, Set, Tuple
 
 from loguru import logger
 from prefect import task
-from prefect.tasks import task_input_hash
 
 from ...definition.enum.causality_computation_status import CausalityComputationStatus
 from ...definition.p_model.causality_adjacency_matrix import CausalityAdjacencyMatrix
@@ -62,11 +60,8 @@ class AdjacencyMatrixTask:
         return adjacency_matrices
 
     @task(
-        persist_result=True,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
     )
     async def extract_adjacency_entries(
         adjacency_matrices: Dict[str, CausalityAdjacencyMatrix],

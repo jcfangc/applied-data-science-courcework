@@ -32,7 +32,7 @@ def _select_continuous_rounds(
     :param end_pct: 结束百分比（0 到 1），用于计算结束下标 / End percentage (0 to 1)
     :return: 连续的轮次列表 / List of consecutive rounds
     """
-    round_list = list(Round)
+    round_list = Round.get_official_rounds()
     n_rounds = len(round_list)
 
     if start_pct is not None and end_pct is not None:
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     # 生成一个测试用 JSON
     for country in countries:
         fake_data_json = generate_fake_ess_variable_data_list(
-            country=country, count=10, round_range_pct=(0, 1)
+            country=country, count=5, round_range_pct=(0.4, 1)
         )
 
         # 保存到文件

@@ -1,13 +1,14 @@
 import asyncio
-from datetime import timedelta
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, TypeVar
 
+import numpy as np
 import polars as pl
 from loguru import logger
 from prefect import task
-from prefect.tasks import task_input_hash
 from scipy.spatial.distance import jensenshannon
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
 from ...definition.enum.round import Round
 from ...definition.p_model.ess_divergence import (
@@ -33,11 +34,8 @@ class ESSDivergenceCalculatorTask:
     """
 
     @task(
-        cache_key_fn=task_input_hash,
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        cache_expiration=timedelta(hours=1),
-        persist_result=True,
     )
     def compute_js_divergence(p: pl.Series, q: pl.Series) -> float:
         """
@@ -77,11 +75,99 @@ class ESSDivergenceCalculatorTask:
         return result
 
     @task(
-        cache_key_fn=task_input_hash,
-        cache_expiration=timedelta(hours=1),
         retries=3,
         retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
-        persist_result=True,
+    )
+    def gaussian_process_interpolate_js_divergences(
+        original_js_list: List[ESSSingleDivergence],
+    ) -> List[ESSSingleDivergence]:
+        """
+        使用高斯过程回归 (Gaussian Process Regression) 对原始的相邻轮次 JS 散度序列进行插值，
+        Use Gaussian Process Regression to interpolate the original JS divergence sequence between adjacent rounds.
+        并在两两相邻散度之间插入一个 'ESSx_5 -> ESS(x+1)_5' 的新散度数据。
+        And insert a new divergence data 'ESSx_5 -> ESS(x+1)_5' between each pair of adjacent divergences.
+
+        :param original_js_list: 原始相邻轮次的 JS 散度列表
+                                    List of original JS divergences between adjacent rounds
+        :return: 包含插值后散度的扩展列表（原散度 + 插值散度），并按顺序排列
+                    Extended list containing interpolated divergences (original + interpolated),
+                    sorted in order
+        """
+
+        # 如果原始数据太少，不做插值，直接返回
+        if len(original_js_list) < 2:
+            return original_js_list
+
+        # 1) 准备训练数据 x, y / Prepare training data x, y
+        #    这里将每个相邻轮次对 (i) 当做 x=i, js_divergence 当做 y。
+        #    Here, treat each adjacent round pair (i) as x=i, js_divergence as y.
+        #    假设共有 n 条相邻散度，那么 x = [0, 1, 2, ..., n-1]，长度 n。
+        #    Assume there are n pairs of adjacent divergences, then x = [0, 1, 2, ..., n-1], length n.
+        x_train = np.array(range(len(original_js_list)), dtype=float).reshape(-1, 1)
+        y_train = np.array([d.js_divergence for d in original_js_list], dtype=float)
+
+        # 2) 拟合高斯过程 / Fit Gaussian Process
+        #    kernel: 常数核 * RBF，长度尺度初始可设 1.0，常数核初始可设 1.0
+        #    kernel: Constant Kernel * RBF, length scale initial 1.0, constant kernel initial 1.0
+        kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(
+            length_scale=1.0, length_scale_bounds=(1e-2, 1e2)
+        )
+        gp = GaussianProcessRegressor(kernel=kernel, alpha=1e-6, n_restarts_optimizer=5)
+        gp.fit(x_train, y_train)
+
+        # 3) 对每个区间的中点 (i+0.5) 进行插值 / Interpolate at midpoints of each interval
+        #    若有 n 条散度，则有 n-1 个插值点，分别位于区间 [i, i+1] 的中点。
+        #    If there are n divergences, there are n-1 interpolation points, each located at the midpoint of interval [i, i+1].
+        #    例如若 n=3, 我们有 x=0,1,2, 则中点是 0.5 和 1.5。
+        #    For example, if n=3, we have x=0,1,2, then midpoints are 0.5 and 1.5.
+        x_mid = np.array([i + 0.5 for i in range(len(original_js_list) - 1)]).reshape(
+            -1, 1
+        )
+        y_pred, y_std = gp.predict(x_mid, return_std=True)
+
+        # 4) 生成最终的插值后列表
+        interpolated_results: List[ESSSingleDivergence] = []
+        num_original_divs = len(original_js_list)
+
+        for i in range(num_original_divs):
+            # 先放入原始散度 / Put in original divergence first
+            interpolated_results.append(original_js_list[i])
+
+            # 如果不是最后一条，再插入一条插值散度
+            # If not the last one, insert an interpolated divergence
+            if i < num_original_divs - 1:
+                # 对应 x_mid[i] 的插值结果 / Interpolated result for x_mid[i]
+                inter_val = y_pred[i]
+
+                # 构造插值轮次: Round_x_5, Round_{x+1}_5
+                # Construct interpolated rounds: Round_x_5, Round_{x+1}_5
+                # 原始是 ESSx -> ESS(x+1)，我们需要 ESSx_5 -> ESS(x+1)_5
+                # Original is ESSx -> ESS(x+1), we need ESSx_5 -> ESS(x+1)_5
+                from_round = original_js_list[i].round_from
+                to_round = original_js_list[i].round_to
+
+                # 构造插值轮次枚举值
+                from_round_interpolated = Round.get_interpolated_round(from_round)
+                to_round_interpolated = Round.get_interpolated_round(to_round)
+
+                # 新增插值散度对象
+                inter_divergence = ESSSingleDivergence(
+                    round_from=from_round_interpolated,
+                    round_to=to_round_interpolated,
+                    js_divergence=float(inter_val),
+                )
+                interpolated_results.append(inter_divergence)
+
+        logger.info(
+            f"插值后的散度列表生成完成，共 {len(interpolated_results)} 条数据。\n"
+            f"Interpolated divergence list generated, total {len(interpolated_results)} items."
+        )
+
+        return interpolated_results
+
+    @task(
+        retries=3,
+        retry_delay_seconds=lambda attempt: backoff.fibonacci(attempt),
     )
     def compute_js_series(
         distributions: Dict[Round, pl.Series],
@@ -129,10 +215,6 @@ class ESSDivergenceCalculatorTask:
         )
         sorted_distributions = [distributions[r] for r in sorted_rounds]
 
-        logger.info(
-            f"数据轮次排序完成: {sorted_rounds}\nData rounds sorted: {sorted_rounds}"
-        )
-
         # 计算相邻轮次的 JS 散度 / Compute JS divergence between adjacent rounds
         js_results = []
         for i in range(len(sorted_distributions) - 1):
@@ -159,6 +241,15 @@ class ESSDivergenceCalculatorTask:
                     js_divergence=js_divergence,
                 )
             )
+
+        if len(js_results) > 2:
+            logger.info("开始对相邻轮次散度进行高斯过程插值，以插入 ESSx_5 轮次...")
+            js_results = (
+                ESSDivergenceCalculatorTask.gaussian_process_interpolate_js_divergences(
+                    js_results
+                )
+            )
+            logger.info("插值完成，已生成额外散度点。")
 
         logger.info(
             "所有相邻轮次的 JS 散度计算完成\n"

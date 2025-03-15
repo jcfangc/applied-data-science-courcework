@@ -1,10 +1,13 @@
 from pathlib import Path
 
 # root
-ROOT_DIR = Path(__file__).parent.parent.parent.parent
+ROOT_DIR = Path(__file__).parent.parent.parent.parent.parent
+
+# root
+ANALYST_DIR = ROOT_DIR / "analyst"
 
 # 1
-SRC_DIR = ROOT_DIR / "src"
+SRC_DIR = ANALYST_DIR / "src"
 
 # 2
 LOG_DIR = SRC_DIR / "log"
