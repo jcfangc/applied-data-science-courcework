@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field, field_validator, model_serializer
 
 from ..enum.round import Round
 
+DIVERGENCE_CEILING = 0.6931471805599453  # log(2)
+
 
 class ESSSingleDivergence(BaseModel):
     """表示两个相邻轮次之间的 JS 散度
@@ -15,7 +17,7 @@ class ESSSingleDivergence(BaseModel):
     js_divergence: float = Field(
         ...,
         ge=0,
-        le=0.7,
+        le=DIVERGENCE_CEILING,
         description="JS 散度值，取值范围为 [0, log(2)] / JS divergence value, range [0, log(2)]",
     )
 

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from loguru import logger
 from prefect import flow
+from tqdm.asyncio import tqdm
 
 from ...definition.const.core import DIVERGENCE_CACHE_DIR, RESULT_DIR
 from ..task.adjacency_matrix import AdjacencyMatrixTask
@@ -17,8 +18,10 @@ async def causality_analysis_flow(
     gg_causality_dir: Path = RESULT_DIR,
     maxlag: int = 2,
 ) -> None:
-    print(json_dir)
-    async for country in ReadWriteTask.extract_countries_from_folder(folder=json_dir):
+    async for country in tqdm(
+        ReadWriteTask.extract_countries_from_folder(folder=json_dir),
+        desc="Processing all countries",
+    ):
         logger.info(f"正在处理国家: {country}")
 
         logger.info("Step 1: 加载 JSON 数据")
@@ -65,6 +68,3 @@ async def causality_analysis_flow(
             output_csv=result_csv,
             maxlag=maxlag,
         )
-
-        # temp
-        break  # 仅处理一个国家，用于测试 / Only process one country for testing
